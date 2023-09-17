@@ -8,10 +8,11 @@ import optax
 from diffrax import (AbstractBrownianPath, ControlTerm, ItoMilstein, MultiTerm,
                      ODETerm, SaveAt, StepTo, diffeqsolve)
 from jaxtyping import Array, Float
+from tqdm import tqdm
 
-t0, t1, n_steps, dim = 0, 1, 100, 1
+t0, t1, n_steps, dim = 0, 1, 20, 1
 
-batch_size, lr, n_iter = 512, 1e-3, 100
+batch_size, lr, n_iter = 512, 1e-2, 100
 
 MU = 1.0
 SIGMA = 1.0
@@ -19,7 +20,7 @@ STRIKE_PRICE = 1.5
 
 
 class FixedBrownianMotion(AbstractBrownianPath):
-    bm: Float[Array, "T+1 dim"] = eqx.field(static=True)
+    bm: Float[Array, "n_steps+1 dim"] = eqx.field(static=True)
     t0: float = eqx.field(static=True)
     t1: float = eqx.field(static=True)
     n_steps: int = eqx.field(static=True)
@@ -118,7 +119,7 @@ class DeepHedgingLoss(eqx.Module):
         return jnp.concatenate([s_diffusion, s * h_diffusion], axis=0)
 
     @jax.named_scope("DeepHedgingLoss")
-    def __call__(self, bm, ts: Float[Array, " T+1"]) -> Float[Array, ""]:
+    def __call__(self, bm, ts: Float[Array, " n_steps+1"]) -> Float[Array, ""]:
         terms = MultiTerm(ODETerm(self.drift), ControlTerm(self.diffusion, bm))
         solver = ItoMilstein()
         saveat = SaveAt(t1=True)
@@ -170,10 +171,14 @@ def run_deep_hedging():
 
     ret = batched_loss(model, jax.random.split(key, batch_size))
 
-    for i in range(n_iter):
+    losses = []
+    pbar = tqdm(range(n_iter))
+    for i in pbar:
         key = jax.random.fold_in(key, i)
         loss, model, opt_state = step(model, opt_state, key)
-        print(loss)
+        losses.append(loss)
+        pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
+
     return ret
 
 
