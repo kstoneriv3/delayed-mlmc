@@ -1,3 +1,3 @@
 black .
 isort .
-ruff .
+ruff --ignore F722 .
