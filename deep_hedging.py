@@ -11,7 +11,7 @@ from jaxtyping import Array, Float
 
 t0, t1, n_steps, dim = 0, 1, 100, 1
 
-batch_size, lr, n_iter = 8, 1e-3, 100
+batch_size, lr, n_iter = 512, 1e-3, 100
 
 MU = 1.0
 SIGMA = 1.0
@@ -169,7 +169,6 @@ def run_deep_hedging():
         return loss, model, opt_state
 
     ret = batched_loss(model, jax.random.split(key, batch_size))
-    breakpoint()
 
     for i in range(n_iter):
         key = jax.random.fold_in(key, i)
