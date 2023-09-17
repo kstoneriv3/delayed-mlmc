@@ -1,21 +1,17 @@
+from functools import partial
 from typing import Callable
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import optax
 from diffrax import (AbstractBrownianPath, ControlTerm, ItoMilstein, MultiTerm,
                      ODETerm, SaveAt, StepTo, diffeqsolve)
 from jaxtyping import Array, Float
 
-# jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_platform_name", "cpu")
-
-# jax.experimental.io_callback()
-
-
 t0, t1, n_steps, dim = 0, 1, 100, 1
 
-batch_size = 8
+batch_size, lr, n_iter = 8, 1e-3, 100
 
 MU = 1.0
 SIGMA = 1.0
@@ -148,16 +144,38 @@ class DeepHedgingLoss(eqx.Module):
 
 
 def run_deep_hedging():
-    keys = jax.random.split(jax.random.PRNGKey(0), 2)
-    objective = DeepHedgingLoss.create_from_asset_process(keys[0])
+    key, model_key = jax.random.split(jax.random.PRNGKey(0), 2)
+    model = DeepHedgingLoss.create_from_asset_process(model_key)
+    optim = optax.sgd(lr)
+    opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
 
-    @jax.vmap
-    def batched_objective(key):
+    @eqx.filter_jit
+    @partial(jax.vmap, in_axes=(None, 0))
+    def batched_loss(model, key):
         bm = FixedBrownianMotion.create_from_interval(t0, t1, n_steps, dim, key)
         ts = (t1 - t0) * jnp.arange(0, n_steps + 1) / n_steps + t0
-        return objective(bm, ts)
+        return model(bm, ts)
 
-    return batched_objective(jax.random.split(keys[1], batch_size)).mean()
+    @eqx.filter_value_and_grad
+    def loss_and_grad(hedging_loss, keys):
+        return jnp.mean(batched_loss(hedging_loss, keys))
+
+    @eqx.filter_jit
+    def step(model, opt_state, key):
+        keys = jax.random.split(key, batch_size)
+        loss, grad = loss_and_grad(model, keys)
+        updates, opt_state = optim.update(grad, opt_state)
+        model = eqx.apply_updates(model, updates)
+        return loss, model, opt_state
+
+    ret = batched_loss(model, jax.random.split(key, batch_size))
+    breakpoint()
+
+    for i in range(n_iter):
+        key = jax.random.fold_in(key, i)
+        loss, model, opt_state = step(model, opt_state, key)
+        print(loss)
+    return ret
 
 
 def test():
@@ -217,6 +235,9 @@ def test():
 
 
 if __name__ == "__main__":
+    # jax.config.update("jax_enable_x64", True)
+    # jax.config.update("jax_platform_name", "cpu")
+    # jax.experimental.io_callback()
     with jax.disable_jit(False):
         # test()
         run_deep_hedging()
