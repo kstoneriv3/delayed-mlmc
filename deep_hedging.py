@@ -1,4 +1,4 @@
-from typing import Callable, Union
+from typing import Callable
 
 import equinox as eqx
 import jax
@@ -13,17 +13,20 @@ jax.config.update("jax_platform_name", "cpu")
 # jax.experimental.io_callback()
 
 
-t0, t1, n_steps, dim = 0, 1, 1000, 1
+t0, t1, n_steps, dim = 0, 1, 100, 1
+
+batch_size = 8
 
 MU = 1.0
 SIGMA = 1.0
+STRIKE_PRICE = 1.5
 
 
 class FixedBrownianMotion(AbstractBrownianPath):
-    bm: Float[Array, "T dim"] = eqx.field(static=False)
-    t0: Union[float, jnp.ndarray]
-    t1: Union[float, jnp.ndarray]
-    n_steps: Union[int, jnp.ndarray]
+    bm: Float[Array, "T+1 dim"] = eqx.field(static=True)
+    t0: float = eqx.field(static=True)
+    t1: float = eqx.field(static=True)
+    n_steps: int = eqx.field(static=True)
 
     def evaluate(self, t0, t1=None, left=True) -> Float[Array, "dim"]:
         del left
@@ -50,7 +53,7 @@ class FixedBrownianMotion(AbstractBrownianPath):
         return FixedBrownianMotion(bm=bm, t0=self.t0, t1=self.t1, n_steps=self.n_steps)
 
 
-class Holding(eqx.Module):
+class HoldingStrategy(eqx.Module):
     mlp: eqx.nn.MLP
 
     def __init__(self, key):
@@ -64,7 +67,7 @@ class Holding(eqx.Module):
             key=key,
         )
 
-    @jax.named_scope("Holding")
+    @jax.named_scope("HoldingStrategy")
     def __call__(self, t, y):
         return self.mlp(jnp.concatenate([t[None], y]))
 
@@ -84,19 +87,22 @@ class DeepHedgingLoss(eqx.Module):
     Quantitative Finance, 19(8), 1271-1291.
     """
 
-    h: eqx.Module  # holding function h(t, s) that takes values in [0, 1]
-    s_drift: Callable
-    s_diffusion: Callable
-    dim: Union[int, jnp.ndarray]
+    w: Float[Array, ""]  # indifference price
+    h: eqx.Module  # holding function delta = h(t, s) that takes values in [0, 1].
+    s_drift: Callable = eqx.field(static=True)
+    s_diffusion: Callable = eqx.field(static=True)
+    dim: int = eqx.field(static=True)
 
     @classmethod
     def create_from_asset_process(cls, key, diffusion=None, drift=None, dim=1):
-        h = Holding(key)
+        assert dim == 1
+        h = HoldingStrategy(key)
+        w = jnp.array(0.0)
         s_drift = drift or BSDrift
         s_diffusion = diffusion or BSDiffusion
-        return cls(h=h, s_drift=s_drift, s_diffusion=s_diffusion, dim=dim)
+        return cls(h=h, w=w, s_drift=s_drift, s_diffusion=s_diffusion, dim=dim)
 
-    def drift(self, t, y: Float[Array, "dim*2"], args) -> Float[Array, "dim*2"]:
+    def drift(self, t, y: Float[Array, "dim+1"], args) -> Float[Array, "dim+1"]:
         # We can only handle cases where dim = 1.
         s = y[:dim]
         dhdt = jax.jacobian(self.h, argnums=0)(t, s)
@@ -105,42 +111,22 @@ class DeepHedgingLoss(eqx.Module):
         s_drift = self.s_drift(t, s)
         s_diffusion = jnp.diag(self.s_diffusion(t, s))
         h_drift = dhdt + dhds * s_drift + dhdss * s_diffusion**2 / 2
-        return jnp.concatenate(
-            [
-                s_drift,
-                # s * h_drift,
-                h_drift,
-            ],
-            axis=0,
-        )
+        return jnp.concatenate([s_drift, s * h_drift], axis=0)
 
-    def diffusion(self, t, y: Float[Array, "dim*2"], args) -> Float[Array, "dim*2 dim"]:
+    def diffusion(self, t, y: Float[Array, "dim+1"], args) -> Float[Array, "dim+1 dim"]:
         # We can only handle cases where dim = 1.
         s = y[:dim]
         dhds = jax.jacobian(self.h, argnums=1)(t, s)[:, 0]
         s_diffusion = self.s_diffusion(t, s)
         h_diffusion = dhds * s_diffusion
-        return jnp.concatenate(
-            [
-                s_diffusion,
-                # s * h_diffusion,
-                h_diffusion,
-            ],
-            axis=0,
-        )
+        return jnp.concatenate([s_diffusion, s * h_diffusion], axis=0)
 
     @jax.named_scope("DeepHedgingLoss")
-    def __call__(self, key):
-        brownian_motion = FixedBrownianMotion.create_from_interval(
-            t0, t1, n_steps, dim, key
-        )
-        ts_fine = (t1 - t0) * jnp.arange(0, n_steps + 1) / n_steps + t0
-        terms = MultiTerm(
-            ODETerm(self.drift), ControlTerm(self.diffusion, brownian_motion)
-        )
+    def __call__(self, bm, ts: Float[Array, " T+1"]) -> Float[Array, ""]:
+        terms = MultiTerm(ODETerm(self.drift), ControlTerm(self.diffusion, bm))
         solver = ItoMilstein()
         saveat = SaveAt(t1=True)
-        stepto = StepTo(ts_fine)
+        stepto = StepTo(ts)
         y0 = jnp.array([1.0, 0.0])
 
         sol = diffeqsolve(
@@ -153,14 +139,25 @@ class DeepHedgingLoss(eqx.Module):
             saveat=saveat,
             stepsize_controller=stepto,
         )
-        breakpoint()
-        return 0
+        s1 = sol.ys[0, 0]
+        z = jnp.maximum(0, s1 - STRIKE_PRICE)
+        hedging_pnl = sol.ys[0, 1]
+        loss = lambda z: (z**2 + 1) / 2  # noqa
+        J = self.w + loss(z - hedging_pnl - self.w)
+        return J
 
 
 def run_deep_hedging():
-    keys = jax.random.split(jax.random.PRNGKey(0), 10)
-    loss = DeepHedgingLoss.create_from_asset_process(keys[0])
-    loss(keys[1])
+    keys = jax.random.split(jax.random.PRNGKey(0), 2)
+    objective = DeepHedgingLoss.create_from_asset_process(keys[0])
+
+    @jax.vmap
+    def batched_objective(key):
+        bm = FixedBrownianMotion.create_from_interval(t0, t1, n_steps, dim, key)
+        ts = (t1 - t0) * jnp.arange(0, n_steps + 1) / n_steps + t0
+        return objective(bm, ts)
+
+    return batched_objective(jax.random.split(keys[1], batch_size)).mean()
 
 
 def test():
