@@ -4,19 +4,20 @@ from typing import Callable
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import optax
 from diffrax import (AbstractBrownianPath, ControlTerm, ItoMilstein, MultiTerm,
                      ODETerm, SaveAt, StepTo, diffeqsolve)
 from jaxtyping import Array, Float
 from tqdm import tqdm
 
-t0, t1, n_steps, dim = 0, 1, 20, 1
+t0, t1, n_steps, dim = 0, 1, 10, 1
 
-batch_size, lr, n_iter = 512, 1e-2, 100
+batch_size, lr, n_iter = 2**12, 1e-2, 100
 
 MU = 1.0
 SIGMA = 1.0
-STRIKE_PRICE = 1.5
+STRIKE_PRICE = jnp.exp(MU)
 
 
 class FixedBrownianMotion(AbstractBrownianPath):
@@ -140,7 +141,8 @@ class DeepHedgingLoss(eqx.Module):
         z = jnp.maximum(0, s1 - STRIKE_PRICE)
         hedging_pnl = sol.ys[0, 1]
         loss = lambda z: (z**2 + 1) / 2  # noqa
-        J = self.w + loss(z - hedging_pnl - self.w)
+        w = 10 * self.w  # rescale to match learning rate with NN
+        J = w + loss(z - hedging_pnl - w)
         return J
 
 
@@ -148,6 +150,7 @@ def run_deep_hedging():
     key, model_key = jax.random.split(jax.random.PRNGKey(0), 2)
     model = DeepHedgingLoss.create_from_asset_process(model_key)
     optim = optax.sgd(lr)
+    # optim = optax.adagrad(lr)
     opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
 
     @eqx.filter_jit
@@ -169,7 +172,72 @@ def run_deep_hedging():
         model = eqx.apply_updates(model, updates)
         return loss, model, opt_state
 
-    ret = batched_loss(model, jax.random.split(key, batch_size))
+    losses = []
+    pbar = tqdm(range(n_iter))
+    for i in pbar:
+        key = jax.random.fold_in(key, i)
+        loss, model, opt_state = step(model, opt_state, key)
+        losses.append(loss)
+        pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
+
+    return ret
+
+
+def run_mlmc_deep_hedging():
+    key, model_key = jax.random.split(jax.random.PRNGKey(0), 2)
+    model = DeepHedgingLoss.create_from_asset_process(model_key)
+    optim = optax.sgd(lr)
+    # optim = optax.adagrad(lr)
+    opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
+
+    @eqx.filter_jit
+    @partial(jax.vmap, in_axes=(None, 0, None))
+    def batched_loss(model, key, level):
+        bm = FixedBrownianMotion.create_from_interval(
+            t0, t1, n_steps * 2**level, dim, key
+        )
+        abm = bm.to_antithetic_path()
+        ts = (t1 - t0) * jnp.arange(0, n_steps * 2**level + 1) / n_steps + t0
+        ts_coarse = ts[::2]
+        if level == 0:
+            return model(bm, ts)
+        else:
+            return (model(bm, ts) + model(abm, ts)) / 2 - model(bm, ts_coarse)
+
+    @eqx.filter_value_and_grad
+    def loss_and_grad(model, keys, level):
+        return jnp.mean(batched_loss(model, keys, level))
+
+    @eqx.filter_jit
+    @partial(jax.vmap, in_axes=(None, 0, None))
+    def grad_l2_norm(model, keys, level):
+        _, grad_ = loss_and_grad(model, keys, level)
+        squared_sum = sum(
+            jnp.linalg.norm(p) ** 2
+            for p in jax.tree_util.tree_flatten(
+                eqx.filter(grad_, eqx.is_inexact_array)
+            )[0]
+        )
+        return squared_sum**0.5
+
+    @eqx.filter_jit
+    def step(model, opt_state, key):
+        keys = jax.random.split(key, batch_size)
+        loss, grad = loss_and_grad(model, keys, 0)
+        updates, opt_state = optim.update(grad, opt_state)
+        model = eqx.apply_updates(model, updates)
+        return loss, model, opt_state
+
+    keys_2d = jax.random.split(key, (4, 1))
+    l_, g_ = loss_and_grad(model, keys_2d[:, 0], 1)
+    breakpoint()
+    l2_norm = grad_l2_norm(model, keys_2d, 1)
+    breakpoint()
+    l2_norm = jnp.mean(l2_norm)
+
+    breakpoint()
+
+    exit()
 
     losses = []
     pbar = tqdm(range(n_iter))
@@ -244,4 +312,4 @@ if __name__ == "__main__":
     # jax.experimental.io_callback()
     with jax.disable_jit(False):
         # test()
-        run_deep_hedging()
+        run_mlmc_deep_hedging()
