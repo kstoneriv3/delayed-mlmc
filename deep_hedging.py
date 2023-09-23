@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 t0, t1, n_steps, dim = 0, 1, 10, 1
 
-batch_size, lr, n_iter = 2**12, 1e-2, 100
+batch_size, lr, n_iter, max_level = 2**12, 1e-2, 100, 8
 
 MU = 1.0
 SIGMA = 1.0
@@ -21,7 +21,9 @@ STRIKE_PRICE = jnp.exp(MU)
 
 
 class FixedBrownianMotion(AbstractBrownianPath):
-    bm: Float[Array, "n_steps+1 dim"] = eqx.field(static=True)
+    bm: Float[
+        Array, "n_steps+1 dim"
+    ]  #  = eqx.field(static=True)  # this causes leaked tracer error
     t0: float = eqx.field(static=True)
     t1: float = eqx.field(static=True)
     n_steps: int = eqx.field(static=True)
@@ -150,7 +152,7 @@ def run_deep_hedging():
     key, model_key = jax.random.split(jax.random.PRNGKey(0), 2)
     model = DeepHedgingLoss.create_from_asset_process(model_key)
     optim = optax.sgd(lr)
-    # optim = optax.adagrad(lr)
+    # optim = optax.adadelta(lr)
     opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
 
     @eqx.filter_jit
@@ -180,14 +182,12 @@ def run_deep_hedging():
         losses.append(loss)
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
 
-    return ret
-
 
 def run_mlmc_deep_hedging():
     key, model_key = jax.random.split(jax.random.PRNGKey(0), 2)
     model = DeepHedgingLoss.create_from_asset_process(model_key)
     optim = optax.sgd(lr)
-    # optim = optax.adagrad(lr)
+    # optim = optax.adadelta(lr)
     opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
 
     @eqx.filter_jit
@@ -197,7 +197,9 @@ def run_mlmc_deep_hedging():
             t0, t1, n_steps * 2**level, dim, key
         )
         abm = bm.to_antithetic_path()
-        ts = (t1 - t0) * jnp.arange(0, n_steps * 2**level + 1) / n_steps + t0
+        ts = (t1 - t0) * jnp.arange(0, n_steps * 2**level + 1) / (
+            n_steps * 2**level
+        ) + t0
         ts_coarse = ts[::2]
         if level == 0:
             return model(bm, ts)
@@ -211,13 +213,8 @@ def run_mlmc_deep_hedging():
     @eqx.filter_jit
     @partial(jax.vmap, in_axes=(None, 0, None))
     def grad_l2_norm(model, keys, level):
-        _, grad_ = loss_and_grad(model, keys, level)
-        squared_sum = sum(
-            jnp.linalg.norm(p) ** 2
-            for p in jax.tree_util.tree_flatten(
-                eqx.filter(grad_, eqx.is_inexact_array)
-            )[0]
-        )
+        l, g = loss_and_grad(model, keys, level)  # noqa
+        squared_sum = sum(jnp.sum(p**2) for p in jax.tree_util.tree_leaves(g))
         return squared_sum**0.5
 
     @eqx.filter_jit
@@ -228,16 +225,11 @@ def run_mlmc_deep_hedging():
         model = eqx.apply_updates(model, updates)
         return loss, model, opt_state
 
-    keys_2d = jax.random.split(key, (4, 1))
-    l_, g_ = loss_and_grad(model, keys_2d[:, 0], 1)
-    breakpoint()
-    l2_norm = grad_l2_norm(model, keys_2d, 1)
-    breakpoint()
-    l2_norm = jnp.mean(l2_norm)
-
-    breakpoint()
-
-    exit()
+    keys_2d = jax.random.split(key, (2**8, 1))
+    l2_norms = []
+    for l in range(max_level):
+        l2_norms.append(grad_l2_norm(model, keys_2d, l))
+    # l2_norm = jnp.mean(l2_norm)
 
     losses = []
     pbar = tqdm(range(n_iter))
@@ -264,8 +256,87 @@ def test():
 
     terms = MultiTerm(ODETerm(drift), ControlTerm(diffusion, brownian_motion))
     terms_a = MultiTerm(ODETerm(drift), ControlTerm(diffusion, brownian_motion_a))
-    solver = ItoMilstein()
-    saveat = SaveAt(dense=True)
+    from diffrax import Euler
+
+    solver = Euler()
+    # solver = ItoMilstein()
+    saveat = SaveAt(t1=True)
+
+    from diffrax import (BacksolveAdjoint, ConstantStepSize, DirectAdjoint,
+                         VirtualBrownianTree)
+
+    brownian_motion = VirtualBrownianTree(t0, t1, tol=0.1, shape=(1,), key=key)
+    terms = MultiTerm(ODETerm(drift), ControlTerm(diffusion, brownian_motion))
+    mk = eqx.filter_make_jaxpr(diffeqsolve)
+
+    f = lambda: mk(
+        ODETerm(drift),
+        solver,
+        t0,
+        t1,
+        dt0=None,
+        y0=1.0,
+        saveat=saveat,
+        stepsize_controller=StepTo(ts_coarse),
+    )
+    ff = lambda: mk(
+        terms,
+        solver,
+        t0,
+        t1,
+        dt0=None,
+        y0=1.0,
+        saveat=saveat,
+        stepsize_controller=StepTo(ts_coarse),
+    )
+
+    g = lambda: mk(ODETerm(drift), solver, t0, t1, dt0=0.2, y0=1.0, saveat=saveat)
+    gg = lambda: mk(
+        terms,
+        solver,
+        t0,
+        t1,
+        dt0=0.2,
+        y0=1.0,
+        saveat=saveat,
+        stepsize_controller=ConstantStepSize(compile_steps=True),
+    )
+
+    h = lambda: mk(
+        ODETerm(drift),
+        solver,
+        t0,
+        t1,
+        dt0=0.2,
+        y0=1.0,
+        saveat=saveat,
+        adjoint=BacksolveAdjoint(),
+    )
+    hh = lambda: mk(
+        terms,
+        solver,
+        t0,
+        t1,
+        dt0=0.2,
+        y0=1.0,
+        saveat=saveat,
+        adjoint=BacksolveAdjoint(),
+    )
+
+    k = lambda: mk(
+        ODETerm(drift),
+        solver,
+        t0,
+        t1,
+        dt0=0.2,
+        y0=1.0,
+        saveat=saveat,
+        adjoint=DirectAdjoint(),
+    )
+    kk = lambda: mk(
+        terms, solver, t0, t1, dt0=0.2, y0=1.0, saveat=saveat, adjoint=DirectAdjoint()
+    )
+    breakpoint()
 
     sol = diffeqsolve(
         terms,
@@ -310,6 +381,6 @@ if __name__ == "__main__":
     # jax.config.update("jax_enable_x64", True)
     # jax.config.update("jax_platform_name", "cpu")
     # jax.experimental.io_callback()
-    with jax.disable_jit(False):
-        # test()
+    with jax.disable_jit(True):
+        test()
         run_mlmc_deep_hedging()
