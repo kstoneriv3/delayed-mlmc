@@ -1,3 +1,4 @@
 black .
 isort .
-ruff --ignore F722 .
+ruff .
+mypy .
