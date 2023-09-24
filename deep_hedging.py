@@ -1,7 +1,8 @@
+import logging
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional, Tuple, Union, cast
+from typing import Any, Callable, Optional, ParamSpec, Tuple, TypeVar, Union, cast
 
 import equinox as eqx
 import jax
@@ -29,16 +30,23 @@ from tqdm import tqdm, trange
 
 T0, T1, N_STEPS, DIM = 0, 1, 10, 1
 
-BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 1000, 7
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 10, 1  # 1000, 7
 
 KEY = jr.PRNGKey(0)
 MU = 1.0
 SIGMA = 1.0
 STRIKE_PRICE = jnp.exp(MU)
 
+N_REPEAT_EXPERIMENT = 10
+
 
 def get_timestamp() -> str:
     return datetime.now().strftime("%Y%m%d%H%M%S")
+
+
+def save_array(array: Array, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, array)
 
 
 class FixedBrownianMotion(AbstractBrownianPath):
@@ -178,6 +186,24 @@ class DeepHedgingLoss(eqx.Module):
 
 @eqx.filter_jit
 @partial(jax.vmap, in_axes=(None, 0, None))
+def batched_loss_baseline(
+    model: DeepHedgingLoss, key: PRNGKeyArray, level: int
+) -> Float[Array, ""]:
+    # bm = VirtualBrownianTree(T0, T1, tol=0.001, shape=(DIM,), key=key)
+    bm = FixedBrownianMotion.create_from_interval(T0, T1, N_STEPS * 2**level, DIM, key)
+    ts = (T1 - T0) * jnp.arange(0, N_STEPS * 2**level + 1) / (N_STEPS * 2**level) + T0
+    return model(bm, ts)
+
+
+@eqx.filter_value_and_grad
+def loss_and_grad_baseline(
+    model: DeepHedgingLoss, keys: PRNGKeyArray, level: int
+) -> Float[Array, ""]:
+    return jnp.mean(batched_loss_baseline(model, keys, level))
+
+
+@eqx.filter_jit
+@partial(jax.vmap, in_axes=(None, 0, None))
 def batched_loss(model: DeepHedgingLoss, key: PRNGKeyArray, level: int) -> Float[Array, ""]:
     # bm = VirtualBrownianTree(T0, T1, tol=0.001, shape=(DIM,), key=key)
     bm = FixedBrownianMotion.create_from_interval(T0, T1, N_STEPS * 2**level, DIM, key)
@@ -214,20 +240,15 @@ def sample_grad_l2_norms(
     return jnp.stack(l2_norms)
 
 
-@eqx.filter_value_and_grad
-def loss_and_grad_diff(
-    model0: DeepHedgingLoss, model1: DeepHedgingLoss, keys: PRNGKeyArray, level: int
-) -> Float[Array, ""]:
-    return jnp.mean(batched_loss(model0, keys, level)) - jnp.mean(batched_loss(model1, keys, level))
-
-
 @eqx.filter_jit
 @partial(jax.vmap, in_axes=(None, None, 0, None))
 def grad_diff_l2_norm(
     model0: DeepHedgingLoss, model1: DeepHedgingLoss, keys: PRNGKeyArray, level: int
 ) -> Float[Array, ""]:
-    l, g = loss_and_grad_diff(model0, model1, keys, level)  # noqa
-    squared_sum = sum(jnp.sum(grad**2) for grad in jax.tree_util.tree_leaves(g))
+    l0, g0 = loss_and_grad(model0, model1, keys, level)  # noqa
+    l1, g1 = loss_and_grad(model1, model1, keys, level)  # noqa
+    g_pairs = zip(jax.tree_util.tree_leaves(g0), jax.tree_util.tree_leaves(g1))
+    squared_sum = sum(jnp.sum((g_pair[0] - g_pair[1]) ** 2) for g_pair in g_pairs)
     return squared_sum**0.5
 
 
@@ -244,24 +265,35 @@ def sample_normalized_grad_diff_l2_norms(
     model1: DeepHedgingLoss,
     key: PRNGKeyArray,
     max_level: int,
-) -> Float[Array, "max_level+1 2**8"]:
-    keys_2d = jr.split(key, (2**8, 1))
+) -> Float[Array, "max_level+1 2**7"]:
+    keys_2d = jr.split(key, (2**7, 1))
     l2_norms = []
     for l in trange(max_level + 1, desc=f"Calculating L2 smoothness", leave=False):
         l2_norms.append(grad_diff_l2_norm(model0, model1, keys_2d, l))
     return jnp.stack(l2_norms) / param_diff_l2_norm(model0, model1)
 
 
-def run_mlmc_deep_hedging() -> None:
+def run_deep_hedging() -> None:
+    """Run deep hedging N_REPEAT_EXPERIMENT times for baseline, mlmc, and delayed-mlmc method."""
     timestamp = get_timestamp()
+    save_path = Path("./logs") / timestamp
     key, model_key = jr.split(KEY, 2)
     model = model_prev = DeepHedgingLoss.create_from_dim_and_key(DIM, model_key)
     optim = optax.sgd(LR)
-    # optim = optax.adadelta(LR)
     opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
 
     @eqx.filter_jit
-    def step(
+    def step_baseline(
+        model: DeepHedgingLoss, opt_state: optax.OptState, key: PRNGKeyArray
+    ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
+        keys = jr.split(key, BATCH_SIZE)
+        loss, grad = loss_and_grad_baseline(model, keys, MAX_LEVEL)
+        updates, opt_state = optim.update(grad, opt_state)
+        model = eqx.apply_updates(model, updates)
+        return loss, model, opt_state
+
+    @eqx.filter_jit
+    def step_mlmc(
         model: DeepHedgingLoss, opt_state: optax.OptState, key: PRNGKeyArray
     ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
         keys = jr.split(key, BATCH_SIZE)
@@ -270,22 +302,48 @@ def run_mlmc_deep_hedging() -> None:
         model = eqx.apply_updates(model, updates)
         return loss, model, opt_state
 
-    losses = []
-    pbar = trange(N_ITER)
-    for i in pbar:
-        key = jr.fold_in(key, i)
-        model_prev = model
-        loss, model, opt_state = step(model, opt_state, key)
-        losses.append(loss)
-        pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
+    @eqx.filter_jit
+    def step_delayed_mlmc(
+        model: DeepHedgingLoss, opt_state: optax.OptState, key: PRNGKeyArray, level: int
+    ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
+        keys = jr.split(key, BATCH_SIZE)
+        loss, grad = loss_and_grad(model, keys, 0)
+        updates, opt_state = optim.update(grad, opt_state)
+        model = eqx.apply_updates(model, updates)
+        return loss, model, opt_state
+
+    losses_all = []
+    for step_func in tqdm([step_baseline, step_mlmc, step_delayed_mlmc]):
+        method = step_func.name.split("_")[1]
+        losses_outer = []
+        for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
+            losses_inner = []
+            pbar = trange(N_ITER, leave=False)
+            for i in pbar:
+                key = jr.fold_in(key, i)
+                model_prev = model
+                if step_func == step_delayed_mlmc:
+                    max_level = i % (MAX_LEVEL + 1)  # TODO
+                    loss, model, opt_state = step_func(model, opt_state, key, max_level)
+                else:
+                    loss, model, opt_state = step_func(model, opt_state, key)
+                losses_inner.append(loss)
+                pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
+            losses_outer.append(jnp.stack(losses_inner))
+
+        save_array(jnp.stack(losses_outer), save_path / f"losses_{method}.npy")
+        losses_all.append(jnp.stack(losses_outer))
+
+    save_array(jnp.stack(losses_all), save_path / f"losses_all.npy")
 
 
 def examine_mlmc_decay() -> None:
+    """Record the variance and smoothness per level during the optimization."""
     timestamp = get_timestamp()
+    save_path = Path("./logs") / timestamp
     key, model_key = jr.split(KEY, 2)
     model = model_prev = DeepHedgingLoss.create_from_dim_and_key(DIM, model_key)
     optim = optax.sgd(LR)
-    # optim = optax.adadelta(LR)
     opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
 
     @eqx.filter_jit
@@ -308,24 +366,27 @@ def examine_mlmc_decay() -> None:
         loss, model, opt_state = step(model, opt_state, key)
         losses.append(loss)
         grad_l2_norms.append(sample_grad_l2_norms(model_prev, key, MAX_LEVEL))
-        normalized_grad_diff_l2_norms.append(
-            sample_normalized_grad_diff_l2_norms(model, model_prev, key, MAX_LEVEL)
-        )
+        if True:
+            normalized_grad_diff_l2_norms.append(
+                sample_normalized_grad_diff_l2_norms(model, model_prev, key, MAX_LEVEL)
+            )
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
 
-    save_path = f"./logs/{timestamp}/losses.npy"
-    jnp.save(save_path, jnp.stack(losses))
-
-    save_path = f"./logs/{timestamp}/grad_l2_norms_step.npy"
-    jnp.save(save_path, jnp.stack(grad_l2_norms, axis=1))
-
-    save_path = f"./logs/{timestamp}/normalized_grad_diff_l2_norms.npy"
-    jnp.save(save_path, jnp.stack(normalized_grad_diff_l2_norms, axis=1))
+    save_array(jnp.stack(losses), save_path / "losses.npy")
+    save_array(jnp.stack(grad_l2_norms, axis=1), save_path / "grad_l2_norms_step.npy")
+    save_array(
+        jnp.stack(normalized_grad_diff_l2_norms, axis=1),
+        save_path / "normalized_grad_diff_l2_norms.npy",
+    )
 
 
 if __name__ == "__main__":
+    logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
     # jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+    jax.experimental.compilation_cache.compilation_cache.initialize_cache(
+        "./.compilation_cache"
+    )  # type: ignore[no-untyped-call]
     # jax.experimental.io_callback()
     with jax.disable_jit(False):
         examine_mlmc_decay()
