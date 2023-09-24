@@ -1,3 +1,4 @@
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple, Union, cast
@@ -26,14 +27,18 @@ from jaxtyping import Array, Float, PRNGKeyArray
 from numpy.typing import NDArray
 from tqdm import tqdm, trange
 
-t0, t1, n_steps, dim = 0, 1, 10, 1
+T0, T1, N_STEPS, DIM = 0, 1, 10, 1
 
-batch_size, lr, n_iter, max_level = 2**11, 1e-2, 1000, 7
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 1000, 7
 
 KEY = jr.PRNGKey(0)
 MU = 1.0
 SIGMA = 1.0
 STRIKE_PRICE = jnp.exp(MU)
+
+
+def get_timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d%H%M%S")
 
 
 class FixedBrownianMotion(AbstractBrownianPath):
@@ -122,7 +127,7 @@ class DeepHedgingLoss(eqx.Module):
 
     def drift(self, t: Scalar, y: Float[Array, "dim+1"], args: Any) -> Float[Array, "dim+1"]:
         # We can only handle cases where dim = 1.
-        s = y[:dim]
+        s = y[: self.dim]
         dhdt = jax.jacobian(self.h, argnums=0)(t, s)
         dhds = jax.jacobian(self.h, argnums=1)(t, s)[:, 0]
         dhdss = jax.hessian(self.h, argnums=1)(t, s)[:, 0, 0]
@@ -135,7 +140,7 @@ class DeepHedgingLoss(eqx.Module):
         self, t: Scalar, y: Float[Array, "dim+1"], args: Any
     ) -> Float[Array, "dim+1 dim"]:
         # We can only handle cases where dim = 1.
-        s = y[:dim]
+        s = y[: self.dim]
         dhds = jax.jacobian(self.h, argnums=1)(t, s)[:, 0]
         s_diffusion = self.s_diffusion(t, s)
         h_diffusion = dhds * s_diffusion
@@ -155,8 +160,8 @@ class DeepHedgingLoss(eqx.Module):
         sol = diffeqsolve(
             terms,
             solver,
-            t0,
-            t1,
+            T0,
+            T1,
             dt0=None,
             y0=y0,
             saveat=saveat,
@@ -173,11 +178,11 @@ class DeepHedgingLoss(eqx.Module):
 
 @eqx.filter_jit
 @partial(jax.vmap, in_axes=(None, 0, None))
-def batched_loss(model: DeepHedgingLoss, key: PRNGKeyArray, level: Int) -> Float[Array, ""]:
-    # bm = VirtualBrownianTree(t0, t1, tol=0.001, shape=(dim,), key=key)
-    bm = FixedBrownianMotion.create_from_interval(t0, t1, n_steps * 2**level, dim, key)
+def batched_loss(model: DeepHedgingLoss, key: PRNGKeyArray, level: int) -> Float[Array, ""]:
+    # bm = VirtualBrownianTree(T0, T1, tol=0.001, shape=(DIM,), key=key)
+    bm = FixedBrownianMotion.create_from_interval(T0, T1, N_STEPS * 2**level, DIM, key)
     # abm = bm.to_antithetic_path()
-    ts = (t1 - t0) * jnp.arange(0, n_steps * 2**level + 1) / (n_steps * 2**level) + t0
+    ts = (T1 - T0) * jnp.arange(0, N_STEPS * 2**level + 1) / (N_STEPS * 2**level) + T0
     ts_coarse = ts[::2]
     if level == 0:
         return model(bm, ts)
@@ -187,20 +192,20 @@ def batched_loss(model: DeepHedgingLoss, key: PRNGKeyArray, level: Int) -> Float
 
 
 @eqx.filter_value_and_grad
-def loss_and_grad(model: DeepHedgingLoss, keys: PRNGKeyArray, level: Int) -> Float[Array, ""]:
+def loss_and_grad(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Float[Array, ""]:
     return jnp.mean(batched_loss(model, keys, level))
 
 
 @eqx.filter_jit
 @partial(jax.vmap, in_axes=(None, 0, None))
-def grad_l2_norm(model: DeepHedgingLoss, keys: PRNGKeyArray, level: Int) -> Float[Array, ""]:
+def grad_l2_norm(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Float[Array, ""]:
     l, g = loss_and_grad(model, keys, level)  # noqa
-    squared_sum = sum(jnp.sum(p**2) for p in jax.tree_util.tree_leaves(g))
+    squared_sum = sum(jnp.sum(grad**2) for grad in jax.tree_util.tree_leaves(g))
     return squared_sum**0.5
 
 
 def sample_grad_l2_norms(
-    model: DeepHedgingLoss, key: PRNGKeyArray, max_level: Int
+    model: DeepHedgingLoss, key: PRNGKeyArray, max_level: int
 ) -> Float[Array, "max_level 2**13"]:
     keys_3d = jr.split(key, (2**5, 2**8, 1))
     l2_norms = []
@@ -210,6 +215,48 @@ def sample_grad_l2_norms(
             list_l2_norm.append(grad_l2_norm(model, keys_2d, l))
         l2_norms.append(jnp.concatenate(list_l2_norm))
     return jnp.stack(l2_norms)
+
+
+@eqx.filter_value_and_grad
+def loss_and_grad_diff(
+    model0: DeepHedgingLoss, model1: DeepHedgingLoss, keys: PRNGKeyArray, level: int
+) -> Float[Array, ""]:
+    return jnp.mean(batched_loss(model0, keys, level)) - jnp.mean(batched_loss(model1, keys, level))
+
+
+@eqx.filter_jit
+@partial(jax.vmap, in_axes=(None, None, 0, None))
+def grad_diff_l2_norm(
+    model0: DeepHedgingLoss, model1: DeepHedgingLoss, keys: PRNGKeyArray, level: int
+) -> Float[Array, ""]:
+    l, g = loss_and_grad_diff(model0, model1, keys, level)  # noqa
+    squared_sum = sum(jnp.sum(grad**2) for grad in jax.tree_util.tree_leaves(g))
+    return squared_sum**0.5
+
+
+@eqx.filter_jit
+def param_diff_l2_norm(model0: DeepHedgingLoss, model1: DeepHedgingLoss) -> Float[Array, ""]:
+    param0 = jax.tree_util.tree_leaves(eqx.filter(model0, eqx.is_inexact_array))
+    param1 = jax.tree_util.tree_leaves(eqx.filter(model1, eqx.is_inexact_array))
+    squared_sum = sum(jnp.sum((p1 - p2) ** 2) for p1, p2 in zip(param0, param1))
+    return squared_sum**0.5
+
+
+def sample_normalized_grad_diff_l2_norms(
+    model0: DeepHedgingLoss,
+    model1: DeepHedgingLoss,
+    key: PRNGKeyArray,
+    max_level: int,
+    leave_tqdm: bool = True,
+) -> Float[Array, "max_level 2**13"]:
+    keys_3d = jr.split(key, (2**5, 2**8, 1))
+    l2_norms = []
+    for l in trange(max_level + 1, desc=f"Calculating L2 smoothness", leave=leave_tqdm):
+        list_l2_norm = []
+        for keys_2d in tqdm(keys_3d, desc=f"Evaluating level {l}", leave=False):
+            list_l2_norm.append(grad_diff_l2_norm(model0, model1, keys_2d, l))
+        l2_norms.append(jnp.concatenate(list_l2_norm))
+    return jnp.stack(l2_norms) / param_diff_l2_norm(model0, model1)
 
 
 def write_array_as_parquet(array: Union[NDArray[np.float_], Array], path: str) -> None:
@@ -222,36 +269,76 @@ def write_array_as_parquet(array: Union[NDArray[np.float_], Array], path: str) -
 
 
 def run_mlmc_deep_hedging() -> None:
+    timestamp = get_timestamp()
     key, model_key = jr.split(KEY, 2)
-    model = DeepHedgingLoss.create_from_dim_and_key(dim, model_key)
-    optim = optax.sgd(lr)
-    # optim = optax.adadelta(lr)
+    model = model_prev = DeepHedgingLoss.create_from_dim_and_key(DIM, model_key)
+    optim = optax.sgd(LR)
+    # optim = optax.adadelta(LR)
     opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
 
     @eqx.filter_jit
     def step(
         model: DeepHedgingLoss, opt_state: optax.OptState, key: PRNGKeyArray
     ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
-        keys = jr.split(key, batch_size)
+        keys = jr.split(key, BATCH_SIZE)
         loss, grad = loss_and_grad(model, keys, 0)
         updates, opt_state = optim.update(grad, opt_state)
         model = eqx.apply_updates(model, updates)
         return loss, model, opt_state
 
-    # grad_l2_norms_before = sample_grad_l2_norms(model, key, 0)
-    grad_l2_norms_before = sample_grad_l2_norms(model, key, 0)
-    write_array_as_parquet(grad_l2_norms_before, "logs/grad_l2_norms_before.parquet")
-
     losses = []
-    pbar = trange(n_iter)
+    pbar = trange(N_ITER)
     for i in pbar:
         key = jr.fold_in(key, i)
+        model_prev = model
         loss, model, opt_state = step(model, opt_state, key)
         losses.append(loss)
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
 
-    grad_l2_norms_after = sample_grad_l2_norms(model, key, max_level)
-    write_array_as_parquet(grad_l2_norms_after, "logs/grad_l2_norms_before.parquet")
+
+def examine_mlmc_decay() -> None:
+    timestamp = get_timestamp()
+    key, model_key = jr.split(KEY, 2)
+    model = model_prev = DeepHedgingLoss.create_from_dim_and_key(DIM, model_key)
+    optim = optax.sgd(LR)
+    # optim = optax.adadelta(LR)
+    opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
+
+    @eqx.filter_jit
+    def step(
+        model: DeepHedgingLoss, opt_state: optax.OptState, key: PRNGKeyArray
+    ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
+        keys = jr.split(key, BATCH_SIZE)
+        loss, grad = loss_and_grad(model, keys, 0)
+        updates, opt_state = optim.update(grad, opt_state)
+        model = eqx.apply_updates(model, updates)
+        return loss, model, opt_state
+
+    # _ = sample_grad_l2_norms(model, key, 0)
+    # loss, model_new, opt_state = step(model, opt_state, key)
+    # breakpoint()
+
+    grad_l2_norms_before = sample_grad_l2_norms(model, key, MAX_LEVEL)
+    write_array_as_parquet(grad_l2_norms_before, f"./logs/{timestamp}/grad_l2_norms_before.parquet")
+
+    losses = []
+    pbar = trange(N_ITER)
+    for i in pbar:
+        key = jr.fold_in(key, i)
+        model_prev = model
+        loss, model, opt_state = step(model, opt_state, key)
+        losses.append(loss)
+        if i % 50 == 0:
+            grad_diff_l2_norms_ = sample_normalized_grad_diff_l2_norms(
+                model, model_prev, key, MAX_LEVEL
+            )
+            write_array_as_parquet(
+                grad_diff_l2_norms_, f"./logs/{timestamp}/grad_diff_l2_norms_step_{i}.parquet"
+            )
+        pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
+
+    grad_l2_norms_after = sample_grad_l2_norms(model, key, MAX_LEVEL)
+    write_array_as_parquet(grad_l2_norms_after, f"./logs/{timestamp}/grad_l2_norms_before.parquet")
 
 
 if __name__ == "__main__":
@@ -259,4 +346,4 @@ if __name__ == "__main__":
     # jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
     # jax.experimental.io_callback()
     with jax.disable_jit(False):
-        run_mlmc_deep_hedging()
+        examine_mlmc_decay()
