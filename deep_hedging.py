@@ -204,17 +204,18 @@ def grad_l2_norm(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Floa
     return squared_sum**0.5
 
 
-def sample_grad_l2_norms(
-    model: DeepHedgingLoss, key: PRNGKeyArray, max_level: int
-) -> Float[Array, "max_level 2**13"]:
+def log_grad_l2_norms(
+    model: DeepHedgingLoss, key: PRNGKeyArray, max_level: int, path: str, leave_tqdm: bool = True
+) -> None:
     keys_3d = jr.split(key, (2**5, 2**8, 1))
     l2_norms = []
-    for l in trange(max_level + 1, desc=f"Calculating variance decay"):
+    for l in trange(max_level + 1, desc=f"Calculating variance decay", leave=leave_tqdm):
         list_l2_norm = []
         for keys_2d in tqdm(keys_3d, desc=f"Evaluating variance of level {l}", leave=False):
             list_l2_norm.append(grad_l2_norm(model, keys_2d, l))
         l2_norms.append(jnp.concatenate(list_l2_norm))
-    return jnp.stack(l2_norms)
+    norms = jnp.stack(l2_norms)
+    write_array_as_parquet(norms, path)
 
 
 @eqx.filter_value_and_grad
@@ -242,13 +243,14 @@ def param_diff_l2_norm(model0: DeepHedgingLoss, model1: DeepHedgingLoss) -> Floa
     return squared_sum**0.5
 
 
-def sample_normalized_grad_diff_l2_norms(
+def log_normalized_grad_diff_l2_norms(
     model0: DeepHedgingLoss,
     model1: DeepHedgingLoss,
     key: PRNGKeyArray,
     max_level: int,
+    path: str,
     leave_tqdm: bool = True,
-) -> Float[Array, "max_level 2**13"]:
+) -> None:
     keys_3d = jr.split(key, (2**5, 2**8, 1))
     l2_norms = []
     for l in trange(max_level + 1, desc=f"Calculating L2 smoothness", leave=leave_tqdm):
@@ -256,7 +258,8 @@ def sample_normalized_grad_diff_l2_norms(
         for keys_2d in tqdm(keys_3d, desc=f"Evaluating level {l}", leave=False):
             list_l2_norm.append(grad_diff_l2_norm(model0, model1, keys_2d, l))
         l2_norms.append(jnp.concatenate(list_l2_norm))
-    return jnp.stack(l2_norms) / param_diff_l2_norm(model0, model1)
+    normalized_norms_ = jnp.stack(l2_norms) / param_diff_l2_norm(model0, model1)
+    write_array_as_parquet(normalized_norms_, path)
 
 
 def write_array_as_parquet(array: Union[NDArray[np.float_], Array], path: str) -> None:
@@ -314,31 +317,22 @@ def examine_mlmc_decay() -> None:
         model = eqx.apply_updates(model, updates)
         return loss, model, opt_state
 
-    # _ = sample_grad_l2_norms(model, key, 0)
-    # loss, model_new, opt_state = step(model, opt_state, key)
-    # breakpoint()
-
-    grad_l2_norms_before = sample_grad_l2_norms(model, key, MAX_LEVEL)
-    write_array_as_parquet(grad_l2_norms_before, f"./logs/{timestamp}/grad_l2_norms_before.parquet")
+    def log_stats(step: int, model: DeepHedgingLoss, model_prev: DeepHedgingLoss) -> None:
+        save_path = f"./logs/{timestamp}/grad_l2_norms_step_{i}.parquet"
+        log_grad_l2_norms(model_prev, key, MAX_LEVEL, save_path, False)
+        save_path = f"./logs/{timestamp}/grad_diff_l2_norms_step_{i}.parquet"
+        log_normalized_grad_diff_l2_norms(model, model_prev, key, MAX_LEVEL, save_path, False)
 
     losses = []
-    pbar = trange(N_ITER)
+    pbar = trange(N_ITER + 1)
     for i in pbar:
         key = jr.fold_in(key, i)
         model_prev = model
         loss, model, opt_state = step(model, opt_state, key)
         losses.append(loss)
         if i % 50 == 0:
-            grad_diff_l2_norms_ = sample_normalized_grad_diff_l2_norms(
-                model, model_prev, key, MAX_LEVEL
-            )
-            write_array_as_parquet(
-                grad_diff_l2_norms_, f"./logs/{timestamp}/grad_diff_l2_norms_step_{i}.parquet"
-            )
+            log_stats(step, model, model_prev)
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
-
-    grad_l2_norms_after = sample_grad_l2_norms(model, key, MAX_LEVEL)
-    write_array_as_parquet(grad_l2_norms_after, f"./logs/{timestamp}/grad_l2_norms_before.parquet")
 
 
 if __name__ == "__main__":
