@@ -227,8 +227,6 @@ def run_mlmc_deep_hedging() -> None:
 
     grad_l2_norms_before = sample_grad_l2_norms(model, key, max_level)
 
-    # breakpoint()
-
     losses = []
     pbar = trange(n_iter)
     for i in pbar:
@@ -237,6 +235,7 @@ def run_mlmc_deep_hedging() -> None:
         losses.append(loss)
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
 
+    grad_l2_norms_after = sample_grad_l2_norms(model, key, max_level)
 
 if __name__ == "__main__":
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
