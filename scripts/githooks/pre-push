@@ -1,0 +1,5 @@
+#!/bin/sh
+
+_GITROOT=$(git rev-parse --show-toplevel)
+cd $_GITROOT
+./scripts/format.sh
