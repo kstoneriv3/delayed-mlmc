@@ -204,18 +204,14 @@ def grad_l2_norm(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Floa
     return squared_sum**0.5
 
 
-def log_grad_l2_norms(
-    model: DeepHedgingLoss, key: PRNGKeyArray, max_level: int, path: str, leave_tqdm: bool = True
-) -> None:
-    keys_3d = jr.split(key, (2**5, 2**8, 1))
+def sample_grad_l2_norms(
+    model: DeepHedgingLoss, key: PRNGKeyArray, max_level: int
+) -> Float[Array, "max_level+1 2**8"]:
+    keys_2d = jr.split(key, (2**8, 1))
     l2_norms = []
-    for l in trange(max_level + 1, desc=f"Calculating variance decay", leave=leave_tqdm):
-        list_l2_norm = []
-        for keys_2d in tqdm(keys_3d, desc=f"Evaluating variance of level {l}", leave=False):
-            list_l2_norm.append(grad_l2_norm(model, keys_2d, l))
-        l2_norms.append(jnp.concatenate(list_l2_norm))
-    norms = jnp.stack(l2_norms)
-    write_array_as_parquet(norms, path)
+    for l in trange(max_level + 1, desc=f"Calculating variance decay", leave=False):
+        l2_norms.append(grad_l2_norm(model, keys_2d, l))
+    return jnp.stack(l2_norms)
 
 
 @eqx.filter_value_and_grad
@@ -243,32 +239,17 @@ def param_diff_l2_norm(model0: DeepHedgingLoss, model1: DeepHedgingLoss) -> Floa
     return squared_sum**0.5
 
 
-def log_normalized_grad_diff_l2_norms(
+def sample_normalized_grad_diff_l2_norms(
     model0: DeepHedgingLoss,
     model1: DeepHedgingLoss,
     key: PRNGKeyArray,
     max_level: int,
-    path: str,
-    leave_tqdm: bool = True,
-) -> None:
-    keys_3d = jr.split(key, (2**5, 2**8, 1))
+) -> Float[Array, "max_level+1 2**8"]:
+    keys_2d = jr.split(key, (2**8, 1))
     l2_norms = []
-    for l in trange(max_level + 1, desc=f"Calculating L2 smoothness", leave=leave_tqdm):
-        list_l2_norm = []
-        for keys_2d in tqdm(keys_3d, desc=f"Evaluating level {l}", leave=False):
-            list_l2_norm.append(grad_diff_l2_norm(model0, model1, keys_2d, l))
-        l2_norms.append(jnp.concatenate(list_l2_norm))
-    normalized_norms_ = jnp.stack(l2_norms) / param_diff_l2_norm(model0, model1)
-    write_array_as_parquet(normalized_norms_, path)
-
-
-def write_array_as_parquet(array: Union[NDArray[np.float_], Array], path: str) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    df = pl.LazyFrame(
-        data=np.asarray(array.T),
-        schema=[f"level_{l}" for l in range(array.shape[0])],
-    )
-    df.sink_parquet(path)
+    for l in trange(max_level + 1, desc=f"Calculating L2 smoothness", leave=False):
+        l2_norms.append(grad_diff_l2_norm(model0, model1, keys_2d, l))
+    return jnp.stack(l2_norms) / param_diff_l2_norm(model0, model1)
 
 
 def run_mlmc_deep_hedging() -> None:
@@ -317,22 +298,29 @@ def examine_mlmc_decay() -> None:
         model = eqx.apply_updates(model, updates)
         return loss, model, opt_state
 
-    def log_stats(step: int, model: DeepHedgingLoss, model_prev: DeepHedgingLoss) -> None:
-        save_path = f"./logs/{timestamp}/grad_l2_norms_step_{i}.parquet"
-        log_grad_l2_norms(model_prev, key, MAX_LEVEL, save_path, False)
-        save_path = f"./logs/{timestamp}/grad_diff_l2_norms_step_{i}.parquet"
-        log_normalized_grad_diff_l2_norms(model, model_prev, key, MAX_LEVEL, save_path, False)
-
     losses = []
+    grad_l2_norms = []
+    normalized_grad_diff_l2_norms = []
     pbar = trange(N_ITER + 1)
     for i in pbar:
         key = jr.fold_in(key, i)
         model_prev = model
         loss, model, opt_state = step(model, opt_state, key)
         losses.append(loss)
-        if i % 50 == 0:
-            log_stats(step, model, model_prev)
+        grad_l2_norms.append(sample_grad_l2_norms(model_prev, key, MAX_LEVEL))
+        normalized_grad_diff_l2_norms.append(
+            sample_normalized_grad_diff_l2_norms(model, model_prev, key, MAX_LEVEL)
+        )
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
+
+    save_path = f"./logs/{timestamp}/losses.npy"
+    jnp.save(save_path, jnp.stack(losses))
+
+    save_path = f"./logs/{timestamp}/grad_l2_norms_step.npy"
+    jnp.save(save_path, jnp.stack(grad_l2_norms, axis=1))
+
+    save_path = f"./logs/{timestamp}/normalized_grad_diff_l2_norms.npy"
+    jnp.save(save_path, jnp.stack(normalized_grad_diff_l2_norms, axis=1))
 
 
 if __name__ == "__main__":
