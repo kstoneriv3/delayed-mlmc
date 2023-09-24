@@ -1,12 +1,15 @@
 from functools import partial
-from typing import Any, Callable, Optional, Tuple, cast
+from pathlib import Path
+from typing import Any, Callable, Optional, Tuple, Union, cast
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import matplotlib.pyplot as plt
+import numpy as np
 import optax
+import polars as pl
 from diffrax import (
     AbstractBrownianPath,
     ControlTerm,
@@ -20,6 +23,7 @@ from diffrax import (
 )
 from diffrax.custom_types import Int, Scalar
 from jaxtyping import Array, Float, PRNGKeyArray
+from numpy.typing import NDArray
 from tqdm import tqdm, trange
 
 t0, t1, n_steps, dim = 0, 1, 10, 1
@@ -208,6 +212,15 @@ def sample_grad_l2_norms(
     return jnp.stack(l2_norms)
 
 
+def write_array_as_parquet(array: Union[NDArray[np.float_], Array], path: str) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    df = pl.LazyFrame(
+        data=np.asarray(array.T),
+        schema=[f"level_{l}" for l in range(array.shape[0])],
+    )
+    df.sink_parquet(path)
+
+
 def run_mlmc_deep_hedging() -> None:
     key, model_key = jr.split(KEY, 2)
     model = DeepHedgingLoss.create_from_dim_and_key(dim, model_key)
@@ -225,7 +238,9 @@ def run_mlmc_deep_hedging() -> None:
         model = eqx.apply_updates(model, updates)
         return loss, model, opt_state
 
-    grad_l2_norms_before = sample_grad_l2_norms(model, key, max_level)
+    # grad_l2_norms_before = sample_grad_l2_norms(model, key, 0)
+    grad_l2_norms_before = sample_grad_l2_norms(model, key, 0)
+    write_array_as_parquet(grad_l2_norms_before, "logs/grad_l2_norms_before.parquet")
 
     losses = []
     pbar = trange(n_iter)
@@ -236,6 +251,8 @@ def run_mlmc_deep_hedging() -> None:
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
 
     grad_l2_norms_after = sample_grad_l2_norms(model, key, max_level)
+    write_array_as_parquet(grad_l2_norms_after, "logs/grad_l2_norms_before.parquet")
+
 
 if __name__ == "__main__":
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
