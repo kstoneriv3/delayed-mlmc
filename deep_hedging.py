@@ -33,7 +33,6 @@ from tqdm import tqdm, trange
 
 T0, T1, N_STEPS, DIM = 0, 1, 10, 1
 
-# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 1000, 5
 BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 1000, 7
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 10, 1
 
@@ -278,7 +277,7 @@ def param_diff_l2_norm(model0: DeepHedgingLoss, model1: DeepHedgingLoss) -> Floa
 
 def log_grad_l2_norms(model: DeepHedgingLoss, save_path: Path, key: PRNGKeyArray) -> None:
     norms_outer = []
-    for l in trange(MAX_LEVEL + 1, desc=f"Evaluating variance"):
+    for l in trange(MAX_LEVEL + 1, 0, -1, desc=f"Evaluating variance"):
         norms_inner = []
         for i in trange(2**5, desc=f"Level {l}", leave=False):
             keys_2d = jr.split(jr.fold_in(key, 2**5 * l + i), (2**8, 1))
@@ -293,7 +292,8 @@ def log_grad_l2_norms(model: DeepHedgingLoss, save_path: Path, key: PRNGKeyArray
 def perturb_model(model: DeepHedgingLoss, key: PRNGKeyArray) -> DeepHedgingLoss:
     keys = jr.split(key, 2**8)
     loss, grad = loss_and_grad(model, keys, 0)
-    return eqx.apply_updates(model, 1e-4 * grad)
+    update = jax.tree_util.tree_map(lambda x: -1e-4 * x, grad)
+    return eqx.apply_updates(model, update)
 
 
 def get_perturbed_models(
@@ -313,14 +313,14 @@ def log_normalized_grad_diff_l2_norms(
 ) -> None:
     models = get_perturbed_models(model, key, 2**5)
     norms_outer = []
-    for l in trange(MAX_LEVEL + 1, desc=f"Evaluating smoothness"):
+    for l in trange(MAX_LEVEL + 1, 0, -1, desc=f"Evaluating smoothness"):
         norms_inner = []
-        for i, m in enumerate(trange(models, desc=f"Level {l}", leave=False)):
+        for i, m in enumerate(tqdm(models, desc=f"Level {l}", leave=False)):
             keys_2d = jr.split(jr.fold_in(key, 2**5 * l + i), (2**7, 1))
             norms_inner.append(
                 grad_diff_l2_norm(model, m, keys_2d, l) / param_diff_l2_norm(model, m)
             )
-        norms_outer.append(jnp.concatenate(norms_inner))
+        norms_outer.append(jnp.stack(norms_inner))
         grad_diff_l2_norm._cached._clear_cache()
     norms = jnp.stack(norms_outer)
     save_array(norms, save_path / "normalized_grad_diff_l2_norms.npy")
@@ -411,6 +411,7 @@ def examine_mlmc_decay() -> None:
         return loss, model, opt_state
 
     losses = []
+    log_normalized_grad_diff_l2_norms(model, save_path / "before", key)
     log_grad_l2_norms(model, save_path / "before", key)
 
     pbar = trange(N_ITER + 1)
@@ -422,13 +423,14 @@ def examine_mlmc_decay() -> None:
 
     save_array(jnp.stack(losses), save_path / "losses.npy")
 
+    log_normalized_grad_diff_l2_norms(model, save_path / "after", key)
     log_grad_l2_norms(model, save_path / "after", key)
 
 
 if __name__ == "__main__":
     logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
-    jax_smi.initialise_tracking()
+    # jax_smi.initialise_tracking()
     # jax.experimental.compilation_cache.compilation_cache.initialize_cache(
     #     "./.compilation_cache"
     # )  # type: ignore[no-untyped-call]
