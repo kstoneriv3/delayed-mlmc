@@ -1,13 +1,14 @@
 import logging
 from datetime import datetime
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
-from typing import Any, Callable, Optional, ParamSpec, Tuple, TypeVar, Union, cast
+from typing import Any, Callable, List, Optional, ParamSpec, Tuple, TypeVar, Union, cast
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import jax_smi
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
@@ -27,11 +28,14 @@ from diffrax.custom_types import Int, Scalar
 from jaxtyping import Array, Float, PRNGKeyArray
 from tqdm import tqdm, trange
 
-jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+# With CPU, it takes an hour to compile, and 5mins per iteration
+# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
 T0, T1, N_STEPS, DIM = 0, 1, 10, 1
 
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 1000, 5
 BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 1000, 7
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 10, 1
 
 KEY = jr.PRNGKey(0)
 MU = 1.0
@@ -39,6 +43,23 @@ SIGMA = 1.0
 STRIKE_PRICE = jnp.exp(MU)
 
 N_REPEAT_EXPERIMENT = 10
+
+
+def simple_filter_jit(fun):  # type: ignore
+    @partial(jax.jit, static_argnums=1)
+    def fun_jitted(dynamic, static):  # type: ignore
+        args, kwargs = eqx._compile_utils.hashable_combine(dynamic, static)
+        out = fun(*args, **kwargs)
+        dynamic_out, static_out = eqx._filters.partition(out, eqx.is_array)
+        return dynamic_out, eqx._module.Static(static_out)
+
+    @wraps(fun)
+    def fun_new(*args, **kwargs):  # type: ignore
+        dynamic, static = eqx._compile_utils.hashable_partition((args, kwargs), eqx.is_array)
+        dynamic_out, static_out = fun_jitted(dynamic, static)
+        return eqx._filters.combine(dynamic_out, static_out.value)
+
+    return fun_new
 
 
 def get_timestamp() -> str:
@@ -196,6 +217,7 @@ def batched_loss_baseline(
     return model(bm, ts)
 
 
+@eqx.filter_jit
 @eqx.filter_value_and_grad
 def loss_and_grad_baseline(
     model: DeepHedgingLoss, keys: PRNGKeyArray, level: int
@@ -218,11 +240,13 @@ def batched_loss(model: DeepHedgingLoss, key: PRNGKeyArray, level: int) -> Float
         return model(bm, ts) - model(bm, ts_coarse)
 
 
+@eqx.filter_jit
 @eqx.filter_value_and_grad
 def loss_and_grad(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Float[Array, ""]:
     return jnp.mean(batched_loss(model, keys, level))
 
 
+# @simple_filter_jit
 @eqx.filter_jit
 @partial(jax.vmap, in_axes=(None, 0, None))
 def grad_l2_norm(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Float[Array, ""]:
@@ -231,16 +255,7 @@ def grad_l2_norm(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Floa
     return squared_sum**0.5
 
 
-def sample_grad_l2_norms(
-    model: DeepHedgingLoss, key: PRNGKeyArray, max_level: int
-) -> Float[Array, "max_level+1 2**8"]:
-    keys_2d = jr.split(key, (2**8, 1))
-    l2_norms = []
-    for l in trange(max_level + 1, desc=f"Calculating variance decay", leave=False):
-        l2_norms.append(grad_l2_norm(model, keys_2d, l))
-    return jnp.stack(l2_norms)
-
-
+# @simple_filter_jit
 @eqx.filter_jit
 @partial(jax.vmap, in_axes=(None, None, 0, None))
 def grad_diff_l2_norm(
@@ -261,17 +276,54 @@ def param_diff_l2_norm(model0: DeepHedgingLoss, model1: DeepHedgingLoss) -> Floa
     return squared_sum**0.5
 
 
-def sample_normalized_grad_diff_l2_norms(
-    model0: DeepHedgingLoss,
-    model1: DeepHedgingLoss,
+def log_grad_l2_norms(model: DeepHedgingLoss, save_path: Path, key: PRNGKeyArray) -> None:
+    norms_outer = []
+    for l in trange(MAX_LEVEL + 1, desc=f"Evaluating variance"):
+        norms_inner = []
+        for i in trange(2**5, desc=f"Level {l}", leave=False):
+            keys_2d = jr.split(jr.fold_in(key, 2**5 * l + i), (2**8, 1))
+            norms_inner.append(grad_l2_norm(model, keys_2d, l))
+        norms_outer.append(jnp.concatenate(norms_inner))
+        grad_l2_norm._cached._clear_cache()
+    norms = jnp.stack(norms_outer)
+    save_array(norms, save_path / "grad_l2_norms.npy")
+
+
+@eqx.filter_jit
+def perturb_model(model: DeepHedgingLoss, key: PRNGKeyArray) -> DeepHedgingLoss:
+    keys = jr.split(key, 2**8)
+    loss, grad = loss_and_grad(model, keys, 0)
+    return eqx.apply_updates(model, 1e-4 * grad)
+
+
+def get_perturbed_models(
+    model: DeepHedgingLoss, key: PRNGKeyArray, n_models: int
+) -> List[DeepHedgingLoss]:
+    models = []
+    for i in trange(2**5, desc="Perturbing models", leave=False):
+        models.append(perturb_model(model, jr.fold_in(key, i)))
+    perturb_model._cached._clear_cache()
+    return models
+
+
+def log_normalized_grad_diff_l2_norms(
+    model: DeepHedgingLoss,
+    save_path: Path,
     key: PRNGKeyArray,
-    max_level: int,
-) -> Float[Array, "max_level+1 2**7"]:
-    keys_2d = jr.split(key, (2**7, 1))
-    l2_norms = []
-    for l in trange(max_level + 1, desc=f"Calculating L2 smoothness", leave=False):
-        l2_norms.append(grad_diff_l2_norm(model0, model1, keys_2d, l))
-    return jnp.stack(l2_norms) / param_diff_l2_norm(model0, model1)
+) -> None:
+    models = get_perturbed_models(model, key, 2**5)
+    norms_outer = []
+    for l in trange(MAX_LEVEL + 1, desc=f"Evaluating smoothness"):
+        norms_inner = []
+        for i, m in enumerate(trange(models, desc=f"Level {l}", leave=False)):
+            keys_2d = jr.split(jr.fold_in(key, 2**5 * l + i), (2**7, 1))
+            norms_inner.append(
+                grad_diff_l2_norm(model, m, keys_2d, l) / param_diff_l2_norm(model, m)
+            )
+        norms_outer.append(jnp.concatenate(norms_inner))
+        grad_diff_l2_norm._cached._clear_cache()
+    norms = jnp.stack(norms_outer)
+    save_array(norms, save_path / "normalized_grad_diff_l2_norms.npy")
 
 
 def run_deep_hedging() -> None:
@@ -347,6 +399,7 @@ def examine_mlmc_decay() -> None:
     optim = optax.sgd(LR)
     opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
 
+    # @simple_filter_jit
     @eqx.filter_jit
     def step(
         model: DeepHedgingLoss, opt_state: optax.OptState, key: PRNGKeyArray
@@ -358,36 +411,24 @@ def examine_mlmc_decay() -> None:
         return loss, model, opt_state
 
     losses = []
-    grad_l2_norms = []
-    normalized_grad_diff_l2_norms = []
-    jax.profiler.save_device_memory_profile(f"profile/memory0.prof")
+    log_grad_l2_norms(model, save_path / "before", key)
+
     pbar = trange(N_ITER + 1)
     for i in pbar:
         key = jr.fold_in(key, i)
-        model_prev = model
-        jax.profiler.save_device_memory_profile(f"profile/memory{i}_before.prof")
         loss, model, opt_state = step(model, opt_state, key)
-        jax.profiler.save_device_memory_profile(f"profile/memory{i}_step.prof")
         losses.append(loss)
-        grad_l2_norms.append(sample_grad_l2_norms(model_prev, key, MAX_LEVEL))
-        jax.profiler.save_device_memory_profile(f"profile/memory{i}_norms.prof")
-        normalized_grad_diff_l2_norms.append(
-            sample_normalized_grad_diff_l2_norms(model, model_prev, key, MAX_LEVEL)
-        )
-        jax.profiler.save_device_memory_profile(f"profile/memory{i}_diff_norms.prof")
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
 
     save_array(jnp.stack(losses), save_path / "losses.npy")
-    save_array(jnp.stack(grad_l2_norms, axis=1), save_path / "grad_l2_norms.npy")
-    save_array(
-        jnp.stack(normalized_grad_diff_l2_norms, axis=1),
-        save_path / "normalized_grad_diff_l2_norms.npy",
-    )
+
+    log_grad_l2_norms(model, save_path / "after", key)
 
 
 if __name__ == "__main__":
     logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
+    jax_smi.initialise_tracking()
     # jax.experimental.compilation_cache.compilation_cache.initialize_cache(
     #     "./.compilation_cache"
     # )  # type: ignore[no-untyped-call]
