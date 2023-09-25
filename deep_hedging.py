@@ -25,12 +25,13 @@ from diffrax import (
 )
 from diffrax.custom_types import Int, Scalar
 from jaxtyping import Array, Float, PRNGKeyArray
-from numpy.typing import NDArray
 from tqdm import tqdm, trange
+
+jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
 T0, T1, N_STEPS, DIM = 0, 1, 10, 1
 
-BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 10, 1  # 1000, 7
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 1000, 7
 
 KEY = jr.PRNGKey(0)
 MU = 1.0
@@ -245,8 +246,8 @@ def sample_grad_l2_norms(
 def grad_diff_l2_norm(
     model0: DeepHedgingLoss, model1: DeepHedgingLoss, keys: PRNGKeyArray, level: int
 ) -> Float[Array, ""]:
-    l0, g0 = loss_and_grad(model0, model1, keys, level)  # noqa
-    l1, g1 = loss_and_grad(model1, model1, keys, level)  # noqa
+    l0, g0 = loss_and_grad(model0, keys, level)  # noqa
+    l1, g1 = loss_and_grad(model1, keys, level)  # noqa
     g_pairs = zip(jax.tree_util.tree_leaves(g0), jax.tree_util.tree_leaves(g1))
     squared_sum = sum(jnp.sum((g_pair[0] - g_pair[1]) ** 2) for g_pair in g_pairs)
     return squared_sum**0.5
@@ -359,21 +360,25 @@ def examine_mlmc_decay() -> None:
     losses = []
     grad_l2_norms = []
     normalized_grad_diff_l2_norms = []
+    jax.profiler.save_device_memory_profile(f"profile/memory0.prof")
     pbar = trange(N_ITER + 1)
     for i in pbar:
         key = jr.fold_in(key, i)
         model_prev = model
+        jax.profiler.save_device_memory_profile(f"profile/memory{i}_before.prof")
         loss, model, opt_state = step(model, opt_state, key)
+        jax.profiler.save_device_memory_profile(f"profile/memory{i}_step.prof")
         losses.append(loss)
         grad_l2_norms.append(sample_grad_l2_norms(model_prev, key, MAX_LEVEL))
-        if True:
-            normalized_grad_diff_l2_norms.append(
-                sample_normalized_grad_diff_l2_norms(model, model_prev, key, MAX_LEVEL)
-            )
+        jax.profiler.save_device_memory_profile(f"profile/memory{i}_norms.prof")
+        normalized_grad_diff_l2_norms.append(
+            sample_normalized_grad_diff_l2_norms(model, model_prev, key, MAX_LEVEL)
+        )
+        jax.profiler.save_device_memory_profile(f"memory{i}_diff_norms.prof")
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
 
     save_array(jnp.stack(losses), save_path / "losses.npy")
-    save_array(jnp.stack(grad_l2_norms, axis=1), save_path / "grad_l2_norms_step.npy")
+    save_array(jnp.stack(grad_l2_norms, axis=1), save_path / "grad_l2_norms.npy")
     save_array(
         jnp.stack(normalized_grad_diff_l2_norms, axis=1),
         save_path / "normalized_grad_diff_l2_norms.npy",
@@ -383,7 +388,6 @@ def examine_mlmc_decay() -> None:
 if __name__ == "__main__":
     logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
-    # jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
     jax.experimental.compilation_cache.compilation_cache.initialize_cache(
         "./.compilation_cache"
     )  # type: ignore[no-untyped-call]
