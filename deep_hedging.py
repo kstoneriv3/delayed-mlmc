@@ -28,8 +28,8 @@ from diffrax.custom_types import Int, Scalar
 from jaxtyping import Array, Float, PRNGKeyArray
 from tqdm import tqdm, trange
 
-# With CPU, it takes an hour to compile, and 5mins per iteration
-# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+# With CPU, it takes an hour to compile, and 5 mins per iteration
+jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
 T0, T1, N_STEPS, DIM = 0, 1, 10, 1
 
@@ -41,7 +41,8 @@ MU = 1.0
 SIGMA = 1.0
 STRIKE_PRICE = jnp.exp(MU)
 
-N_REPEAT_EXPERIMENT = 10
+# N_REPEAT_EXPERIMENT = 10
+N_REPEAT_EXPERIMENT = 1
 
 
 def simple_filter_jit(fun):  # type: ignore
@@ -360,14 +361,14 @@ def run_deep_hedging() -> None:
         model: DeepHedgingLoss, opt_state: optax.OptState, key: PRNGKeyArray, level: int
     ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
         keys = jr.split(key, BATCH_SIZE)
-        loss, grad = loss_and_grad(model, keys, 0)
+        loss, grad = loss_and_grad(model, keys, level)
         updates, opt_state = optim.update(grad, opt_state)
         model = eqx.apply_updates(model, updates)
         return loss, model, opt_state
 
     losses_all = []
     for step_func in tqdm([step_baseline, step_mlmc, step_delayed_mlmc]):
-        method = step_func.name.split("_")[1]
+        method = step_func.__name__.removeprefix("step_")
         losses_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
             losses_inner = []
@@ -376,8 +377,8 @@ def run_deep_hedging() -> None:
                 key = jr.fold_in(key, i)
                 model_prev = model
                 if step_func == step_delayed_mlmc:
-                    max_level = i % (MAX_LEVEL + 1)  # TODO
-                    loss, model, opt_state = step_func(model, opt_state, key, max_level)
+                    level = i % (MAX_LEVEL + 1)  # TODO
+                    loss, model, opt_state = step_func(model, opt_state, key, level)
                 else:
                     loss, model, opt_state = step_func(model, opt_state, key)
                 losses_inner.append(loss)
@@ -436,4 +437,5 @@ if __name__ == "__main__":
     # )  # type: ignore[no-untyped-call]
     # jax.experimental.io_callback()
     with jax.disable_jit(False):
-        examine_mlmc_decay()
+        # examine_mlmc_decay()
+        run_deep_hedging()
