@@ -374,7 +374,7 @@ def examine_mlmc_decay() -> None:
         normalized_grad_diff_l2_norms.append(
             sample_normalized_grad_diff_l2_norms(model, model_prev, key, MAX_LEVEL)
         )
-        jax.profiler.save_device_memory_profile(f"memory{i}_diff_norms.prof")
+        jax.profiler.save_device_memory_profile(f"profile/memory{i}_diff_norms.prof")
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
 
     save_array(jnp.stack(losses), save_path / "losses.npy")
@@ -388,9 +388,9 @@ def examine_mlmc_decay() -> None:
 if __name__ == "__main__":
     logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
-    jax.experimental.compilation_cache.compilation_cache.initialize_cache(
-        "./.compilation_cache"
-    )  # type: ignore[no-untyped-call]
+    # jax.experimental.compilation_cache.compilation_cache.initialize_cache(
+    #     "./.compilation_cache"
+    # )  # type: ignore[no-untyped-call]
     # jax.experimental.io_callback()
     with jax.disable_jit(False):
         examine_mlmc_decay()

@@ -10,6 +10,11 @@ __pycache__/
 tags
 [._]*.swp
 
+# project specific
+profile/
+logs/
+.compilation_cache/
+
 # Distribution / packaging
 .Python
 build/
