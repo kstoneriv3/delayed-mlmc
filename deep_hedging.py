@@ -32,7 +32,7 @@ from tqdm import tqdm, trange
 # With CPU, it takes an hour to compile, and 5 mins per iteration
 jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
-T0, T1, N_STEPS, DIM = 0, 1, 10, 1
+T0, T1, N_STEPS, DIM = 0, 1, 3, 1
 
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 1000, 7
 BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-2, 10, 1
@@ -349,12 +349,12 @@ def step_baseline(
     opt_state: optax.OptState,
     optim: optax.GradientTranformation,
     key: PRNGKeyArray,
-) -> Tuple[DeepHedgingLoss, optax.OptState]:
+) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
     keys = jr.split(key, BATCH_SIZE)
     loss, grad = loss_and_grad_baseline(model, keys, MAX_LEVEL)
     updates, opt_state = optim.update(grad, opt_state)
     model = eqx.apply_updates(model, updates)
-    return model, opt_state
+    return loss, model, opt_state
 
 
 @eqx.filter_jit
@@ -375,13 +375,15 @@ def step_mlmc(
     opt_state: optax.OptState,
     optim: optax.GradientTranformation,
     key: PRNGKeyArray,
-) -> Tuple[DeepHedgingLoss, optax.OptState]:
+) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
     grad_per_level = []
     for level in range(MAX_LEVEL + 1):
         keys = jr.split(key, BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level))
         loss, grad = loss_and_grad(model, keys, level)
         grad_per_level.append(grad)
-    return _step_from_grad_per_level(model, opt_state, optim, grad_per_level)
+    model, opt_state = _step_from_grad_per_level(model, opt_state, optim, grad_per_level)
+    loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE)))
+    return loss, model, opt_state
 
 
 def step_delayed_mlmc(
@@ -391,7 +393,7 @@ def step_delayed_mlmc(
     grad_per_level: List[DeepHedgingLoss],
     key: PRNGKeyArray,
     step: int,
-) -> Tuple[DeepHedgingLoss, optax.OptState, List[DeepHedgingLoss]]:
+) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState, List[DeepHedgingLoss]]:
     keys = jr.split(key, BATCH_SIZE)
     for level in range(MAX_LEVEL + 1):
         # if step % math.ceil(2 ** (SMOOTHNESS_DECAY_RATE * level)) == 0:
@@ -400,7 +402,8 @@ def step_delayed_mlmc(
             loss, grad = loss_and_grad(model, keys, level)
             grad_per_level[level] = grad
     model, opt_state = _step_from_grad_per_level(model, opt_state, optim, grad_per_level)
-    return model, opt_state, grad_per_level
+    loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE)))
+    return loss, model, opt_state, grad_per_level
 
 
 def run_deep_hedging() -> None:
@@ -427,12 +430,11 @@ def run_deep_hedging() -> None:
                 key_inner = jr.fold_in(key_outer, i)
                 model_prev = model
                 if method != "delayed_mlmc":
-                    model, opt_state, grad_per_level = step_func(
+                    loss, model, opt_state, grad_per_level = step_func(
                         model, opt_state, grad_per_level, key_inner, i
                     )
                 else:
-                    model, opt_state = step_func(model, opt_state, key_inner)
-                loss = jnp.mean(batched_loss_baseline(model, jr.split(key_inner, BATCH_SIZE)))
+                    loss, model, opt_state = step_func(model, opt_state, key_inner)
                 losses_inner.append(loss)
                 pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, float(loss)))
             losses_outer.append(jnp.stack(losses_inner))
@@ -449,28 +451,17 @@ def examine_mlmc_decay() -> None:
     save_path = Path("./logs") / timestamp
     key, model_key = jr.split(KEY, 2)
     model = model_prev = DeepHedgingLoss.create_from_dim_and_key(DIM, model_key)
-    optim = optax.sgd(LR)
-    opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
 
-    # @simple_filter_jit
-    @eqx.filter_jit
-    def step(
-        model: DeepHedgingLoss, opt_state: optax.OptState, key: PRNGKeyArray
-    ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
-        keys = jr.split(key, BATCH_SIZE)
-        loss, grad = loss_and_grad(model, keys, 0)
-        updates, opt_state = optim.update(grad, opt_state)
-        model = eqx.apply_updates(model, updates)
-        return loss, model, opt_state
-
-    losses = []
     log_normalized_grad_diff_l2_norms(model, save_path / "before", key)
     log_grad_l2_norms(model, save_path / "before", key)
 
+    optim = optax.sgd(LR)
+    opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
+    losses = []
     pbar = trange(N_ITER + 1)
     for i in pbar:
         key = jr.fold_in(key, i)
-        loss, model, opt_state = step(model, opt_state, key)
+        loss, model, opt_state = step_baseline(model, opt_state, optim, key)
         losses.append(loss)
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
 
