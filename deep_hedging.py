@@ -3,12 +3,13 @@ import math
 from datetime import datetime
 from functools import partial, wraps
 from pathlib import Path
-from typing import Any, Callable, List, Optional, ParamSpec, Tuple, TypeVar, Union, cast
+from typing import Any, Callable, List, Optional, ParamSpec, Tuple, Union, cast
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import jax.tree_util as jtu
 import jax_smi
 import matplotlib.pyplot as plt
 import numpy as np
@@ -79,17 +80,17 @@ def save_array(array: Array, path: Path) -> None:
 
 
 def tree_zeros_like(tree: PyTree) -> PyTree:
-    return jax.tree_util.tree_map(jnp.zeros_like, tree, is_leaf=eqx.is_array)
+    return jtu.tree_map(jnp.zeros_like, tree)
 
 
-def array_sum(*arrays: Array) -> Array:
-    assert all(arr is not None for arr in arrays)
-    assert all(arr.shape == arrays[0].shape for arr in arrays[1:])
-    return cast(Array, sum(arrays))
+def sum_if_arrays(*args: Array) -> Array:
+    assert all(isinstance(a, Array) for a in args)
+    assert all(arr.shape == args[0].shape for arr in args[1:])
+    return cast(Array, sum(args))
 
 
-def tree_sum(*trees: PyTree) -> PyTree:
-    return jax.tree_util.tree_map(array_sum, *trees, is_leaf=eqx.is_array)
+def tree_sum(trees: List[PyTree]) -> PyTree:
+    return jtu.tree_map(sum_if_arrays, *trees)
 
 
 class FixedBrownianMotion(AbstractBrownianPath):
@@ -232,7 +233,7 @@ class DeepHedgingLoss(eqx.Module):
 def batched_loss_baseline(model: DeepHedgingLoss, key: PRNGKeyArray) -> Float[Array, ""]:
     # bm = VirtualBrownianTree(T0, T1, tol=0.001, shape=(DIM,), key=key)
     bm = FixedBrownianMotion.create_from_interval(T0, T1, N_STEPS * 2**MAX_LEVEL, DIM, key)
-    ts = (T1 - T0) * jnp.arange(0, N_STEPS * 2**MAX_LEVEL + 1) / (N_STEPS * 2**MAX_LEVEL) + T0
+    ts = (T1 - T0) * jnp.arange(N_STEPS * 2**MAX_LEVEL + 1) / (N_STEPS * 2**MAX_LEVEL) + T0
     return model(bm, ts)
 
 
@@ -248,7 +249,7 @@ def batched_loss(model: DeepHedgingLoss, key: PRNGKeyArray, level: int) -> Float
     # bm = VirtualBrownianTree(T0, T1, tol=0.001, shape=(DIM,), key=key)
     bm = FixedBrownianMotion.create_from_interval(T0, T1, N_STEPS * 2**level, DIM, key)
     # abm = bm.to_antithetic_path()
-    ts = (T1 - T0) * jnp.arange(0, N_STEPS * 2**level + 1) / (N_STEPS * 2**level) + T0
+    ts = (T1 - T0) * jnp.arange(N_STEPS * 2**level + 1) / (N_STEPS * 2**level) + T0
     ts_coarse = ts[::2]
     if level == 0:
         return model(bm, ts)
@@ -268,7 +269,7 @@ def loss_and_grad(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Flo
 @partial(jax.vmap, in_axes=(None, 0, None))
 def grad_l2_norm(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Float[Array, ""]:
     l, g = loss_and_grad(model, keys, level)  # noqa
-    squared_sum = sum(jnp.sum(grad**2) for grad in jax.tree_util.tree_leaves(g))
+    squared_sum = sum(jnp.sum(grad**2) for grad in jtu.tree_leaves(g))
     return squared_sum**0.5
 
 
@@ -280,22 +281,22 @@ def grad_diff_l2_norm(
 ) -> Float[Array, ""]:
     l0, g0 = loss_and_grad(model0, keys, level)  # noqa
     l1, g1 = loss_and_grad(model1, keys, level)  # noqa
-    g_pairs = zip(jax.tree_util.tree_leaves(g0), jax.tree_util.tree_leaves(g1))
+    g_pairs = zip(jtu.tree_leaves(g0), jtu.tree_leaves(g1))
     squared_sum = sum(jnp.sum((g_pair[0] - g_pair[1]) ** 2) for g_pair in g_pairs)
     return squared_sum**0.5
 
 
 @eqx.filter_jit
 def param_diff_l2_norm(model0: DeepHedgingLoss, model1: DeepHedgingLoss) -> Float[Array, ""]:
-    param0 = jax.tree_util.tree_leaves(eqx.filter(model0, eqx.is_inexact_array))
-    param1 = jax.tree_util.tree_leaves(eqx.filter(model1, eqx.is_inexact_array))
+    param0 = jtu.tree_leaves(eqx.filter(model0, eqx.is_inexact_array))
+    param1 = jtu.tree_leaves(eqx.filter(model1, eqx.is_inexact_array))
     squared_sum = sum(jnp.sum((p1 - p2) ** 2) for p1, p2 in zip(param0, param1))
     return squared_sum**0.5
 
 
 def log_grad_l2_norms(model: DeepHedgingLoss, save_path: Path, key: PRNGKeyArray) -> None:
     norms_outer = []
-    for l in trange(MAX_LEVEL + 1, 0, -1, desc=f"Evaluating variance"):
+    for l in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating variance"):
         norms_inner = []
         for i in trange(2**5, desc=f"Level {l}", leave=False):
             keys_2d = jr.split(jr.fold_in(key, 2**5 * l + i), (2**8, 1))
@@ -310,7 +311,7 @@ def log_grad_l2_norms(model: DeepHedgingLoss, save_path: Path, key: PRNGKeyArray
 def perturb_model(model: DeepHedgingLoss, key: PRNGKeyArray) -> DeepHedgingLoss:
     keys = jr.split(key, 2**8)
     loss, grad = loss_and_grad(model, keys, 0)
-    update = jax.tree_util.tree_map(lambda x: -1e-4 * x, grad)
+    update = jtu.tree_map(lambda x: -1e-4 * x, grad)
     return eqx.apply_updates(model, update)
 
 
@@ -331,7 +332,7 @@ def log_normalized_grad_diff_l2_norms(
 ) -> None:
     models = get_perturbed_models(model, key, 2**5)
     norms_outer = []
-    for l in trange(MAX_LEVEL + 1, 0, -1, desc=f"Evaluating smoothness"):
+    for l in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating smoothness"):
         norms_inner = []
         for i, m in enumerate(tqdm(models, desc=f"Level {l}", leave=False)):
             keys_2d = jr.split(jr.fold_in(key, 2**5 * l + i), (2**7, 1))
@@ -378,7 +379,7 @@ def step_mlmc(
     key: PRNGKeyArray,
 ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
     grad_per_level = []
-    for level in range(MAX_LEVEL + 1):
+    for level in range(MAX_LEVEL, -1, -1):
         batch_size = BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level)
         keys = jr.split(key, batch_size)
         loss, grad = loss_and_grad(model, keys, level)
@@ -401,7 +402,7 @@ def step_delayed_mlmc(
     periods = [
         math.floor(2 ** (1 + SMOOTHNESS_DECAY_RATE * (level - 1))) for level in range(MAX_LEVEL + 1)
     ]
-    for level in range(MAX_LEVEL + 1):
+    for level in range(MAX_LEVEL, -1, -1):
         if step % periods[level] == 0:
             batch_size = BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level)
             keys = jr.split(key, batch_size)
@@ -419,12 +420,14 @@ def run_deep_hedging() -> None:
     save_path = Path("./logs") / timestamp
 
     losses_all = []
-    for method in tqdm(["mlmc", "delayed_mlmc", "baseline"]):
+    for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
         # for method in tqdm(["baseline"]):
         losses_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
             key_outer, model_key = jr.split(jr.fold_in(KEY, n), 2)
             model = model_prev = DeepHedgingLoss.create_from_dim_and_key(DIM, model_key)
+            models = [model, model_prev]
+
             optim = optax.sgd(LR)
             opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
             if method == "delayed_mlmc":
