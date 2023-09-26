@@ -54,23 +54,6 @@ VARIANCE_DECAY_RATE = 2
 SMOOTHNESS_DECAY_RATE = 1
 
 
-def simple_filter_jit(fun):  # type: ignore
-    @partial(jax.jit, static_argnums=1)
-    def fun_jitted(dynamic, static):  # type: ignore
-        args, kwargs = eqx._compile_utils.hashable_combine(dynamic, static)
-        out = fun(*args, **kwargs)
-        dynamic_out, static_out = eqx._filters.partition(out, eqx.is_array)
-        return dynamic_out, eqx._module.Static(static_out)
-
-    @wraps(fun)
-    def fun_new(*args, **kwargs):  # type: ignore
-        dynamic, static = eqx._compile_utils.hashable_partition((args, kwargs), eqx.is_array)
-        dynamic_out, static_out = fun_jitted(dynamic, static)
-        return eqx._filters.combine(dynamic_out, static_out.value)
-
-    return fun_new
-
-
 def get_timestamp() -> str:
     return datetime.now().strftime("%Y%m%d%H%M%S")
 
@@ -271,7 +254,6 @@ def loss_and_grad(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Flo
     return jnp.mean(batched_loss(model, keys, level))
 
 
-# @simple_filter_jit
 @eqx.filter_jit
 @partial(jax.vmap, in_axes=(None, 0, None))
 def grad_l2_norm(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Float[Array, ""]:
@@ -280,7 +262,6 @@ def grad_l2_norm(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Floa
     return squared_sum**0.5
 
 
-# @simple_filter_jit
 @eqx.filter_jit
 @partial(jax.vmap, in_axes=(None, None, 0, None))
 def grad_diff_l2_norm(
