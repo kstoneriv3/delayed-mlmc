@@ -14,6 +14,7 @@ def get_latest_timestamp() -> str:
 def main(timestamp: Optional[str] = None) -> None:
     timestamp = str(timestamp or get_latest_timestamp())
     log_dir = Path("./logs") / timestamp
+    breakpoint()
     losses = np.load(log_dir / "losses.npy")
     norms = np.load(log_dir / "grad_l2_norms.npy")
     diff_norms = np.load(log_dir / "normalized_grad_diff_l2_norms.npy")
