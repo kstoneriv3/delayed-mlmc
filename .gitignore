@@ -13,6 +13,7 @@ tags
 # project specific
 profile/
 logs/
+mlruns/
 .compilation_cache/
 
 # Distribution / packaging
