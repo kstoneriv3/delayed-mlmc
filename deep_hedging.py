@@ -256,7 +256,7 @@ def loss_and_grad(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Flo
     print(f"loss_and_grad traced for level {level}")
     from jax._src.lax import control_flow
 
-    print(control_flow._initial_style_jaxprs_with_common_consts.cache_info())
+    print(control_flow._initial_style_jaxprs_with_common_consts.cache_info())  # type: ignore
     print()
     return jnp.mean(batched_loss(model, keys, level))
 
