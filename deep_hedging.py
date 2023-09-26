@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from datetime import datetime
 from functools import partial, wraps
 from pathlib import Path
@@ -31,13 +32,13 @@ from jaxtyping import Array, Float, PRNGKeyArray, PyTree
 from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
-jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
-# T0, T1, N_STEPS, DIM = 0, 1, 1000, 1
-T0, T1, N_STEPS, DIM = 0, 1, 3, 1
+T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
 
-# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 2e-3, 1000, 7
-BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 10, 1
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 2e-3, 1000, 7
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 10, 1
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 2e-3, 400, 1
 
 KEY = jr.PRNGKey(0)
 MU = 1.0
@@ -229,27 +230,33 @@ class DeepHedgingLoss(eqx.Module):
 
 
 @eqx.filter_jit
-@partial(jax.vmap, in_axes=(None, 0))
-def batched_loss_baseline(model: DeepHedgingLoss, key: PRNGKeyArray) -> Float[Array, ""]:
+@partial(jax.vmap, in_axes=(None, 0, None))
+def batched_loss_baseline(
+    model: DeepHedgingLoss, key: PRNGKeyArray, max_level: int
+) -> Float[Array, ""]:
     # bm = VirtualBrownianTree(T0, T1, tol=0.001, shape=(DIM,), key=key)
-    bm = FixedBrownianMotion.create_from_interval(T0, T1, N_STEPS * 2**MAX_LEVEL, DIM, key)
-    ts = (T1 - T0) * jnp.arange(N_STEPS * 2**MAX_LEVEL + 1) / (N_STEPS * 2**MAX_LEVEL) + T0
+    n_steps = N_STEPS_LEVEL0 * 2**max_level
+    bm = FixedBrownianMotion.create_from_interval(T0, T1, n_steps, DIM, key)
+    ts = (T1 - T0) * jnp.arange(n_steps + 1) / n_steps + T0
     return model(bm, ts)
 
 
 @eqx.filter_jit
 @eqx.filter_value_and_grad
-def loss_and_grad_baseline(model: DeepHedgingLoss, keys: PRNGKeyArray) -> Float[Array, ""]:
-    return jnp.mean(batched_loss_baseline(model, keys))
+def loss_and_grad_baseline(
+    model: DeepHedgingLoss, keys: PRNGKeyArray, max_level: int
+) -> Float[Array, ""]:
+    return jnp.mean(batched_loss_baseline(model, keys, max_level))
 
 
 @eqx.filter_jit
 @partial(jax.vmap, in_axes=(None, 0, None))
 def batched_loss(model: DeepHedgingLoss, key: PRNGKeyArray, level: int) -> Float[Array, ""]:
+    n_steps = N_STEPS_LEVEL0 * 2**level
+    bm = FixedBrownianMotion.create_from_interval(T0, T1, n_steps, DIM, key)
     # bm = VirtualBrownianTree(T0, T1, tol=0.001, shape=(DIM,), key=key)
-    bm = FixedBrownianMotion.create_from_interval(T0, T1, N_STEPS * 2**level, DIM, key)
     # abm = bm.to_antithetic_path()
-    ts = (T1 - T0) * jnp.arange(N_STEPS * 2**level + 1) / (N_STEPS * 2**level) + T0
+    ts = (T1 - T0) * jnp.arange(n_steps + 1) / n_steps + T0
     ts_coarse = ts[::2]
     if level == 0:
         return model(bm, ts)
@@ -351,9 +358,10 @@ def step_baseline(
     optim: optax.GradientTransformation,
     opt_state: optax.OptState,
     key: PRNGKeyArray,
+    max_level: int,
 ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
     keys = jr.split(key, BATCH_SIZE)
-    loss, grad = loss_and_grad_baseline(model, keys)
+    loss, grad = loss_and_grad_baseline(model, keys, max_level)
     updates, opt_state = optim.update(grad, opt_state)
     model = eqx.apply_updates(model, updates)
     return loss, model, opt_state
@@ -420,9 +428,11 @@ def run_deep_hedging() -> None:
     save_path = Path("./logs") / timestamp
 
     losses_all = []
+    times_all = []
     for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
         # for method in tqdm(["baseline"]):
         losses_outer = []
+        times_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
             key_outer, model_key = jr.split(jr.fold_in(KEY, n), 2)
             model = model_prev = DeepHedgingLoss.create_from_dim_and_key(DIM, model_key)
@@ -436,13 +446,16 @@ def run_deep_hedging() -> None:
                 ]
 
             losses_inner = []
+            times_inner = []
             pbar = trange(N_ITER, leave=False)
             for i in pbar:
                 key_inner = jr.fold_in(key_outer, i)
                 model_prev = model
                 match method:
                     case "baseline":
-                        loss, model, opt_state = step_baseline(model, optim, opt_state, key_inner)
+                        loss, model, opt_state = step_baseline(
+                            model, optim, opt_state, key_inner, MAX_LEVEL
+                        )
                     case "mlmc":
                         loss, model, opt_state = step_mlmc(model, optim, opt_state, key_inner)
                     case "delayed_mlmc":
@@ -450,13 +463,18 @@ def run_deep_hedging() -> None:
                             model, optim, opt_state, grad_per_level, key_inner, i
                         )
                 losses_inner.append(loss)
+                times_inner.append(time.time())
                 pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, float(loss)))
             losses_outer.append(jnp.stack(losses_inner))
+            times_outer.append(jnp.stack(losses_inner))
 
         save_array(jnp.stack(losses_outer), save_path / f"losses_{method}.npy")
+        save_array(jnp.stack(times_outer), save_path / f"times_{method}.npy")
         losses_all.append(jnp.stack(losses_outer))
+        times_all.append(jnp.stack(times_outer))
 
     save_array(jnp.stack(losses_all), save_path / f"losses_all.npy")
+    save_array(jnp.stack(times_all), save_path / f"times_all.npy")
 
 
 def examine_mlmc_decay() -> None:
@@ -466,8 +484,8 @@ def examine_mlmc_decay() -> None:
     key, model_key = jr.split(KEY, 2)
     model = model_prev = DeepHedgingLoss.create_from_dim_and_key(DIM, model_key)
 
-    log_normalized_grad_diff_l2_norms(model, save_path / "before", key)
-    log_grad_l2_norms(model, save_path / "before", key)
+    # log_normalized_grad_diff_l2_norms(model, save_path / "before", key)
+    # log_grad_l2_norms(model, save_path / "before", key)
 
     optim = optax.sgd(LR)
     opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
@@ -475,7 +493,7 @@ def examine_mlmc_decay() -> None:
     pbar = trange(N_ITER + 1)
     for i in pbar:
         key = jr.fold_in(key, i)
-        loss, model, opt_state = step_baseline(model, optim, opt_state, key)
+        loss, model, opt_state = step_baseline(model, optim, opt_state, key, 0)
         losses.append(loss)
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
 
@@ -494,5 +512,5 @@ if __name__ == "__main__":
     # )  # type: ignore[no-untyped-call]
     # jax.experimental.io_callback()
     with jax.disable_jit(False):
-        # examine_mlmc_decay()
-        run_deep_hedging()
+        examine_mlmc_decay()
+        # run_deep_hedging()
