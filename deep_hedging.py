@@ -32,13 +32,14 @@ from jaxtyping import Array, Float, PRNGKeyArray, PyTree
 from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
-# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+
 
 T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
 
-BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 2e-3, 1000, 7
-# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 10, 1
-# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 2e-3, 400, 1
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 2e-3, 1000, 7
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**8, 1e-3, 400, 6
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 3
 
 KEY = jr.PRNGKey(0)
 MU = 1.0
@@ -48,10 +49,10 @@ STRIKE_PRICE = jnp.exp(MU)
 # N_REPEAT_EXPERIMENT = 10
 N_REPEAT_EXPERIMENT = 1
 COST_RATE = 1
-# VARIANCE_DECAY_RATE = 1.5
-VARIANCE_DECAY_RATE = 2
-# SMOOTHNESS_DECAY_RATE = 0.7
-SMOOTHNESS_DECAY_RATE = 1
+VARIANCE_DECAY_RATE = 1.2
+# VARIANCE_DECAY_RATE = 2
+SMOOTHNESS_DECAY_RATE = 1.0
+# SMOOTHNESS_DECAY_RATE = 1
 
 
 def get_timestamp() -> str:
@@ -251,6 +252,12 @@ def batched_loss(model: DeepHedgingLoss, key: PRNGKeyArray, level: int) -> Float
 @eqx.filter_jit
 @eqx.filter_value_and_grad
 def loss_and_grad(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Float[Array, ""]:
+    print()
+    print(f"loss_and_grad traced for level {level}")
+    from jax._src.lax import control_flow
+
+    print(control_flow._initial_style_jaxprs_with_common_consts.cache_info())
+    print()
     return jnp.mean(batched_loss(model, keys, level))
 
 
@@ -369,12 +376,12 @@ def step_mlmc(
 ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
     grad_per_level = []
     for level in range(MAX_LEVEL, -1, -1):
-        batch_size = BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level)
+        batch_size = math.ceil(BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level))
         keys = jr.split(key, batch_size)
         loss, grad = loss_and_grad(model, keys, level)
         grad_per_level.append(grad)
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
-    loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE)))
+    loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE), MAX_LEVEL))
     return loss, model, opt_state
 
 
@@ -393,12 +400,13 @@ def step_delayed_mlmc(
     ]
     for level in range(MAX_LEVEL, -1, -1):
         if step % periods[level] == 0:
-            batch_size = BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level)
+            batch_size = math.ceil(BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level))
             keys = jr.split(key, batch_size)
             loss, grad = loss_and_grad(model, keys, level)
             grad_per_level[level] = grad
+
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
-    loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE)))
+    loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE), MAX_LEVEL))
     return loss, model, opt_state, grad_per_level
 
 
@@ -411,7 +419,6 @@ def run_deep_hedging() -> None:
     losses_all = []
     times_all = []
     for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
-        # for method in tqdm(["baseline"]):
         losses_outer = []
         times_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
@@ -479,6 +486,7 @@ def examine_mlmc_decay() -> None:
         pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
 
     save_array(jnp.stack(losses), save_path / "losses.npy")
+    step_baseline._cached._clear_cache()
 
     log_normalized_grad_diff_l2_norms(model, save_path / "after", key)
     log_grad_l2_norms(model, save_path / "after", key)
@@ -493,5 +501,5 @@ if __name__ == "__main__":
     # )  # type: ignore[no-untyped-call]
     # jax.experimental.io_callback()
     with jax.disable_jit(False):
-        examine_mlmc_decay()
-        # run_deep_hedging()
+        # examine_mlmc_decay()
+        run_deep_hedging()
