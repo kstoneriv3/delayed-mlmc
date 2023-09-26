@@ -13,6 +13,7 @@ import jax.random as jr
 import jax.tree_util as jtu
 import jax_smi
 import matplotlib.pyplot as plt
+import mlflow
 import numpy as np
 import optax
 import polars as pl
@@ -32,13 +33,14 @@ from jaxtyping import Array, Float, PRNGKeyArray, PyTree
 from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
-jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
 
 T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
 
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 2e-3, 1000, 7
-BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**8, 1e-3, 400, 6
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**8, 1e-3, 400, 6
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-4, 4000, 5
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 3
 
 KEY = jr.PRNGKey(0)
@@ -413,6 +415,7 @@ def step_delayed_mlmc(
 def run_deep_hedging() -> None:
     """Run deep hedging N_REPEAT_EXPERIMENT times for baseline, mlmc, and delayed-mlmc method."""
 
+    mlflow.set_experiment("run_deep_hedging")
     timestamp = get_timestamp()
     save_path = Path("./logs") / timestamp
 
@@ -435,26 +438,35 @@ def run_deep_hedging() -> None:
 
             losses_inner = []
             times_inner = []
-            pbar = trange(N_ITER, leave=False)
-            for i in pbar:
-                key_inner = jr.fold_in(key_outer, i)
-                model_prev = model
-                match method:
-                    case "baseline":
-                        loss, model, opt_state = step_baseline(
-                            model, optim, opt_state, key_inner, MAX_LEVEL
-                        )
-                    case "mlmc":
-                        loss, model, opt_state = step_mlmc(model, optim, opt_state, key_inner)
-                    case "delayed_mlmc":
-                        loss, model, opt_state, grad_per_level = step_delayed_mlmc(
-                            model, optim, opt_state, grad_per_level, key_inner, i
-                        )
-                losses_inner.append(loss)
-                times_inner.append(time.time())
-                pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, float(loss)))
-            losses_outer.append(jnp.stack(losses_inner))
-            times_outer.append(jnp.stack(losses_inner))
+            with mlflow.start_run():
+                global_params = {
+                    k: v
+                    for k, v in globals().items()
+                    if k.upper() == k and isinstance(v, (int, float, str))
+                }
+                mlflow.log_params(global_params)
+                mlflow.log_params({"method": method})
+                pbar = trange(N_ITER, leave=False)
+                for i in pbar:
+                    key_inner = jr.fold_in(key_outer, i)
+                    model_prev = model
+                    match method:
+                        case "baseline":
+                            loss, model, opt_state = step_baseline(
+                                model, optim, opt_state, key_inner, MAX_LEVEL
+                            )
+                        case "mlmc":
+                            loss, model, opt_state = step_mlmc(model, optim, opt_state, key_inner)
+                        case "delayed_mlmc":
+                            loss, model, opt_state, grad_per_level = step_delayed_mlmc(
+                                model, optim, opt_state, grad_per_level, key_inner, i
+                            )
+                    losses_inner.append(loss)
+                    times_inner.append(time.time())
+                    pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, float(loss)))
+                    mlflow.log_metric("loss", float(loss), i)
+                losses_outer.append(jnp.stack(losses_inner))
+                times_outer.append(jnp.stack(losses_inner))
 
         save_array(jnp.stack(losses_outer), save_path / f"losses_{method}.npy")
         save_array(jnp.stack(times_outer), save_path / f"times_{method}.npy")
@@ -467,6 +479,7 @@ def run_deep_hedging() -> None:
 
 def examine_mlmc_decay() -> None:
     """Record the variance and smoothness per level during the optimization."""
+    mlflow.set_experiment("examine_mlmc_decay")
     timestamp = get_timestamp()
     save_path = Path("./logs") / timestamp
     key, model_key = jr.split(KEY, 2)
@@ -475,21 +488,30 @@ def examine_mlmc_decay() -> None:
     # log_normalized_grad_diff_l2_norms(model, save_path / "before", key)
     # log_grad_l2_norms(model, save_path / "before", key)
 
-    optim = optax.sgd(LR)
-    opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
-    losses = []
-    pbar = trange(N_ITER + 1)
-    for i in pbar:
-        key = jr.fold_in(key, i)
-        loss, model, opt_state = step_baseline(model, optim, opt_state, key, 0)
-        losses.append(loss)
-        pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
+    with mlflow.start_run():
+        global_params = {
+            k: v
+            for k, v in globals().items()
+            if k.upper() == k and isinstance(v, (int, float, str))
+        }
+        mlflow.log_params(global_params)
 
-    save_array(jnp.stack(losses), save_path / "losses.npy")
-    step_baseline._cached._clear_cache()
+        optim = optax.sgd(LR)
+        opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
+        losses = []
+        pbar = trange(N_ITER + 1)
+        for i in pbar:
+            key = jr.fold_in(key, i)
+            loss, model, opt_state = step_baseline(model, optim, opt_state, key, 0)
+            losses.append(loss)
+            pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, loss))
+            mlflow.log_metric("loss", float(loss), i)
 
-    log_normalized_grad_diff_l2_norms(model, save_path / "after", key)
-    log_grad_l2_norms(model, save_path / "after", key)
+        save_array(jnp.stack(losses), save_path / "losses.npy")
+        step_baseline._cached._clear_cache()
+
+        log_normalized_grad_diff_l2_norms(model, save_path / "after", key)
+        log_grad_l2_norms(model, save_path / "after", key)
 
 
 if __name__ == "__main__":
