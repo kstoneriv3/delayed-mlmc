@@ -53,7 +53,7 @@ BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-4, 4000, 5
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 3
 
-KEY = jr.PRNGKey(1)
+KEY = jr.PRNGKey(2)
 MU = 1.0
 SIGMA = 1.0
 STRIKE_PRICE = jnp.exp(MU)
@@ -335,11 +335,11 @@ def param_diff_l2_norm(model0: DeepHedgingLoss, model1: DeepHedgingLoss) -> Floa
 
 def log_grad_l2_norms(model: DeepHedgingLoss, save_path: Path, key: PRNGKeyArray) -> None:
     norms_outer = []
-    for l in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating variance"):
+    for level in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating variance"):
         norms_inner = []
-        for i in trange(2**5, desc=f"Level {l}", leave=False):
-            keys_2d = jr.split(jr.fold_in(key, 2**5 * l + i), (2**8, 1))
-            norms_inner.append(grad_l2_norm(model, keys_2d, l))
+        for i in trange(2**8, desc=f"Level {level}", leave=False):
+            keys_2d = jr.split(jr.fold_in(key, 2**8 * level + i), (2**8, 1))
+            norms_inner.append(grad_l2_norm(model, keys_2d, level))
         norms_outer.append(jnp.concatenate(norms_inner))
         grad_l2_norm._cached._clear_cache()
     norms = jnp.stack(norms_outer)
@@ -369,14 +369,14 @@ def log_normalized_grad_diff_l2_norms(
     save_path: Path,
     key: PRNGKeyArray,
 ) -> None:
-    models = get_perturbed_models(model, key, 2**5)
+    models = get_perturbed_models(model, key, 2**8)
     norms_outer = []
-    for l in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating smoothness"):
+    for level in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating smoothness"):
         norms_inner = []
-        for i, m in enumerate(tqdm(models, desc=f"Level {l}", leave=False)):
-            keys_2d = jr.split(jr.fold_in(key, 2**5 * l + i), (2**7, 1))
+        for i, m in enumerate(tqdm(models, desc=f"Level {level}", leave=False)):
+            keys_2d = jr.split(jr.fold_in(key, 2**8 * level + i), (2**7, 1))
             norms_inner.append(
-                grad_diff_l2_norm(model, m, keys_2d, l) / param_diff_l2_norm(model, m)
+                grad_diff_l2_norm(model, m, keys_2d, level) / param_diff_l2_norm(model, m)
             )
         norms_outer.append(jnp.stack(norms_inner))
         grad_diff_l2_norm._cached._clear_cache()
@@ -430,7 +430,10 @@ def step_mlmc(
         loss, grad = loss_and_grad(model, keys, level)
         grad_per_level[level] = grad
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
-    loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE), MAX_LEVEL))
+    if WORLD_SIZE != 1 and WORLD_RANK != 0:
+        loss = 0.0
+    else:
+        loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE), MAX_LEVEL))
     return loss, model, opt_state
 
 
@@ -458,7 +461,10 @@ def step_delayed_mlmc(
         grad_per_level[level] = grad
 
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
-    loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE), MAX_LEVEL))
+    if WORLD_SIZE != 1 and WORLD_RANK != 0:
+        loss = 0.0
+    else:
+        loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE), MAX_LEVEL))
     return loss, model, opt_state, grad_per_level
 
 
@@ -474,8 +480,7 @@ def run_deep_hedging() -> None:
     # for method in tqdm(["baseline"]):
     # for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
     # for method in tqdm(["mlmc", "delayed_mlmc"]):
-    for method in tqdm(["baseline"]):
-        # for method in tqdm(["delayed_mlmc"]):
+    for method in tqdm(["mlmc"]):
         losses_outer = []
         times_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
@@ -487,7 +492,7 @@ def run_deep_hedging() -> None:
             opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
             if method == "delayed_mlmc":
                 grad_per_level = [
-                    tree_zeros_like(eqx.filter(model, eqx.is_array)) for l in range(MAX_LEVEL + 1)
+                    tree_zeros_like(eqx.filter(model, eqx.is_array)) for _ in range(MAX_LEVEL + 1)
                 ]
 
             losses_inner = []
