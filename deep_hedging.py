@@ -2,6 +2,7 @@ import logging
 import math
 import os
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from functools import partial, wraps
 from pathlib import Path
@@ -70,13 +71,26 @@ WORLD_SIZE = MPI.COMM_WORLD.Get_size()
 
 assert WORLD_SIZE == 1 or WORLD_SIZE == MAX_LEVEL + 1
 
-dummy_func = lambda *args, **kwargs: None  # noqa
+
+@contextmanager  # type: ignore[arg-type]
+def nullcontext(*args: Any, **kwargs: Any) -> None:  # type: ignore
+    yield
+
+
+def nullfunc(*args: Any, **kwargs: Any) -> None:
+    pass
+
 
 if WORLD_RANK != 1:
-    mlflow.start_run = dummy_func
-    mlflow.log_params = dummy_func
-    mlflow.log_metric = dummy_func
-    mlflow.set_experiment = dummy_func
+    mlflow.start_run = nullcontext
+    mlflow.log_params = nullfunc
+    mlflow.log_metric = nullfunc
+    mlflow.set_experiment = nullfunc
+
+
+def mpi_breakpoint(rank: int = 0) -> None:
+    if WORLD_RANK == rank:
+        breakpoint()  # noqa
 
 
 def get_timestamp() -> str:
