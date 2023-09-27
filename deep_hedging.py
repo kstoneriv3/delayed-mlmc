@@ -1,10 +1,14 @@
 import logging
 import math
+import os
 import time
 from datetime import datetime
 from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Callable, List, Optional, ParamSpec, Tuple, Union, cast
+
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=7"  # noqa
+os.environ["JAX_LOG_COMPILES"] = "1"  # noqa
 
 import equinox as eqx
 import jax
@@ -34,13 +38,15 @@ from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
 # jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+CPU = jax.devices("cpu")
+GPU = jax.devices("gpu")
 
 
 T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
 
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 2e-3, 1000, 7
-# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**8, 1e-3, 400, 6
-BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-4, 4000, 5
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-4, 4000, 5
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 3
 
 KEY = jr.PRNGKey(0)
@@ -380,7 +386,17 @@ def step_mlmc(
     for level in range(MAX_LEVEL, -1, -1):
         batch_size = math.ceil(BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level))
         keys = jr.split(key, batch_size)
+
+        device = CPU[level - 1] if level > 0 else GPU[0]
+        keys = jax.device_put(keys, device)
+        dynamic_model, static_model = eqx._filters.partition(model, eqx.is_array)
+        dynamic_model = jtu.tree_map(lambda x: jax.device_put(x, device), dynamic_model)
+        model = eqx._filters.combine(dynamic_model, static_model)
+
         loss, grad = loss_and_grad(model, keys, level)
+
+        grad = jax.device_put(grad, GPU[0])
+
         grad_per_level.append(grad)
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
     loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE), MAX_LEVEL))
@@ -421,7 +437,9 @@ def run_deep_hedging() -> None:
 
     losses_all = []
     times_all = []
-    for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
+    # for method in tqdm(["baseline"]):
+    # for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
+    for method in tqdm(["mlmc"]):
         losses_outer = []
         times_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
@@ -438,7 +456,7 @@ def run_deep_hedging() -> None:
 
             losses_inner = []
             times_inner = []
-            with mlflow.start_run():
+            with mlflow.start_run(run_name=f"{method}-{timestamp}"):
                 global_params = {
                     k: v
                     for k, v in globals().items()
@@ -446,7 +464,8 @@ def run_deep_hedging() -> None:
                 }
                 mlflow.log_params(global_params)
                 mlflow.log_params({"method": method})
-                pbar = trange(N_ITER, leave=False)
+                n_iter = 5 * N_ITER if method == "delayed_mlmc" else N_ITER
+                pbar = trange(n_iter, leave=False)
                 for i in pbar:
                     key_inner = jr.fold_in(key_outer, i)
                     model_prev = model
