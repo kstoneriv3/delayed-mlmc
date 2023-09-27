@@ -53,7 +53,7 @@ BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-4, 4000, 5
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 3
 
-KEY = jr.PRNGKey(2)
+KEY = jr.PRNGKey(1)
 MU = 1.0
 SIGMA = 1.0
 STRIKE_PRICE = jnp.exp(MU)
@@ -81,7 +81,7 @@ def nullfunc(*args: Any, **kwargs: Any) -> None:
     pass
 
 
-if WORLD_RANK != 1:
+if WORLD_RANK != 0:
     mlflow.start_run = nullcontext
     mlflow.log_params = nullfunc
     mlflow.log_metric = nullfunc
@@ -473,8 +473,9 @@ def run_deep_hedging() -> None:
     times_all = []
     # for method in tqdm(["baseline"]):
     # for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
-    # for method in tqdm(["delayed_mlmc"]):
-    for method in tqdm(["mlmc", "delayed_mlmc"]):
+    # for method in tqdm(["mlmc", "delayed_mlmc"]):
+    for method in tqdm(["baseline"]):
+        # for method in tqdm(["delayed_mlmc"]):
         losses_outer = []
         times_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
@@ -497,6 +498,7 @@ def run_deep_hedging() -> None:
                     for k, v in globals().items()
                     if k.upper() == k and isinstance(v, (int, float, str))
                 }
+                global_params.update({"KEY": int(KEY[1])})  # type: ignore
                 mlflow.log_params(global_params)
                 mlflow.log_params({"method": method, "key_outer": key_outer})
                 n_iter = 5 * N_ITER if method == "delayed_mlmc" else N_ITER
