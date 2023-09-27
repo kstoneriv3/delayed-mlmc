@@ -7,8 +7,11 @@ from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Callable, List, Optional, ParamSpec, Tuple, Union, cast
 
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=7"  # noqa
+# Showing the compilation logs
 os.environ["JAX_LOG_COMPILES"] = "1"  # noqa
+# The below does not work as it just emulates devices for debugging purpose.
+# It seems that only way to use multiprocessing with jax is manual MPI by mpi4jax.
+# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=7"
 
 import equinox as eqx
 import jax
@@ -37,9 +40,9 @@ from jaxtyping import Array, Float, PRNGKeyArray, PyTree
 from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
-# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
-CPU = jax.devices("cpu")
+jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 GPU = jax.devices("gpu")
+CPU = jax.devices("cpu")
 
 
 T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
@@ -49,7 +52,7 @@ BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-4, 4000, 5
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 3
 
-KEY = jr.PRNGKey(0)
+KEY = jr.PRNGKey(1)
 MU = 1.0
 SIGMA = 1.0
 STRIKE_PRICE = jnp.exp(MU)
@@ -84,6 +87,12 @@ def sum_if_arrays(*args: Array) -> Array:
 
 def tree_sum(trees: List[PyTree]) -> PyTree:
     return jtu.tree_map(sum_if_arrays, *trees)
+
+
+def tree_device_put(tree: PyTree, device: jax.Device) -> PyTree:
+    dynamic, static = eqx._filters.partition(tree, eqx.is_array)
+    dynamic = jtu.tree_map(lambda x: jax.device_put(x, device), dynamic)
+    return eqx._filters.combine(dynamic, static)
 
 
 class FixedBrownianMotion(AbstractBrownianPath):
@@ -262,9 +271,7 @@ def batched_loss(model: DeepHedgingLoss, key: PRNGKeyArray, level: int) -> Float
 def loss_and_grad(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Float[Array, ""]:
     print()
     print(f"loss_and_grad traced for level {level}")
-    from jax._src.lax import control_flow
-
-    print(control_flow._initial_style_jaxprs_with_common_consts.cache_info())  # type: ignore
+    print(jax._src.lax.control_flow._initial_style_jaxprs_with_common_consts.cache_info())  # type: ignore
     print()
     return jnp.mean(batched_loss(model, keys, level))
 
@@ -387,15 +394,12 @@ def step_mlmc(
         batch_size = math.ceil(BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level))
         keys = jr.split(key, batch_size)
 
-        device = CPU[level - 1] if level > 0 else GPU[0]
-        keys = jax.device_put(keys, device)
-        dynamic_model, static_model = eqx._filters.partition(model, eqx.is_array)
-        dynamic_model = jtu.tree_map(lambda x: jax.device_put(x, device), dynamic_model)
-        model = eqx._filters.combine(dynamic_model, static_model)
+        device = CPU[level % len(CPU)]
+        keys, model = tree_device_put((keys, model), device)
 
         loss, grad = loss_and_grad(model, keys, level)
 
-        grad = jax.device_put(grad, GPU[0])
+        grad = jax.device_put(grad, CPU[0])
 
         grad_per_level.append(grad)
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
@@ -439,6 +443,7 @@ def run_deep_hedging() -> None:
     times_all = []
     # for method in tqdm(["baseline"]):
     # for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
+    # for method in tqdm(["delayed_mlmc"]):
     for method in tqdm(["mlmc"]):
         losses_outer = []
         times_outer = []
@@ -463,7 +468,7 @@ def run_deep_hedging() -> None:
                     if k.upper() == k and isinstance(v, (int, float, str))
                 }
                 mlflow.log_params(global_params)
-                mlflow.log_params({"method": method})
+                mlflow.log_params({"method": method, "key_outer": key_outer})
                 n_iter = 5 * N_ITER if method == "delayed_mlmc" else N_ITER
                 pbar = trange(n_iter, leave=False)
                 for i in pbar:
@@ -513,6 +518,7 @@ def examine_mlmc_decay() -> None:
             for k, v in globals().items()
             if k.upper() == k and isinstance(v, (int, float, str))
         }
+        global_params.update({"KEY": int(KEY[1])})  # type: ignore
         mlflow.log_params(global_params)
 
         optim = optax.sgd(LR)
