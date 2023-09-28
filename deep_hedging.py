@@ -393,7 +393,7 @@ def log_normalized_grad_diff_l2_norms(
     save_path: Path,
     key: PRNGKeyArray,
 ) -> None:
-    models = get_perturbed_models(model, key, 2**6)
+    models = get_perturbed_models(model, key, 2**8)
     norms_outer = []
     for level in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating smoothness"):
         norms_inner = []
@@ -579,6 +579,7 @@ def examine_mlmc_decay() -> None:
     model = model_prev = DeepHedgingLoss.create_from_dim_and_key(DIM, model_key)
 
     load_model_weight(model, save_path / "model.eqx")
+    log_normalized_grad_diff_l2_norms(model, save_path / "after", key)
     log_grad_l2_norms(model, save_path / "after", key)
     exit()
 

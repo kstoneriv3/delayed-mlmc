@@ -6,6 +6,9 @@ from typing import Dict, List, Optional
 import fire
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.cm import tab10
+
+plt.style.use("seaborn-whitegrid")
 
 ArrayDict = Dict[str, List[Optional[np.ndarray]]]
 
@@ -47,18 +50,54 @@ def try_load_arrays(timestamps: List[str]) -> ArrayDict:
     return array_dict
 
 
-def plot_decays(array_dict: ArrayDict) -> None:
+def plot_variance_decay(array_dict: ArrayDict) -> None:
     norms = array_dict["norms_after"][0]
+    assert isinstance(norms, np.ndarray)
     mean_per_level = (norms**2).mean(axis=1)
     std_per_level = (norms**2).std(axis=1) / norms.shape[1] ** 0.5
     std_per_level_log_trans = std_per_level / mean_per_level
     upper = mean_per_level * np.exp(std_per_level / mean_per_level)
     lower = mean_per_level / np.exp(std_per_level / mean_per_level)
-    levels = np.arange(norms.shape[0])
-    plt.plot(levels, mean_per_level)
-    plt.fill_between(levels, upper, lower, alpha=0.3)
-    plt.xlabel("Level")
-    plt.ylabel(r"Trace of the second moment of gradient $\mathrm{E}[\|\Delta\nabla_\ell \hat F\|$")
+    levels = range(norms.shape[0])
+    line = plt.plot(levels, mean_per_level)[0]
+    band = plt.fill_between(levels, upper, lower, alpha=0.3)
+    O1 = plt.plot(levels, [mean_per_level[0] * 2 ** (-l) for l in levels], c=tab10(7))[0]
+    O2 = plt.plot(levels, [mean_per_level[0] * 2 ** (-2 * l) for l in levels], c=tab10(7))[0]
+    plt.legend(
+        [(line, band), (O1,), (O2,)],
+        [r"$\mathrm{E}\|\Delta\nabla_\ell \hat F\|^2$", r"$O(2^{-\ell})$", r"$O(2^{-2\ell})$"],
+    )
+    plt.xlabel(r"Level $\ell$")
+    plt.ylabel(
+        r"Trace of the second moment of the coupled gradient estimator $\Delta\nabla_\ell \hat F$"
+    )
+    plt.yscale("log")
+    plt.savefig("./logs/variance_decay.pdf")
+
+
+def plot_smoothness_decay(array_dict: ArrayDict) -> None:
+    norms = array_dict["norms_after"][0]
+    assert isinstance(norms, np.ndarray)
+    mean_per_level = (norms**2).mean(axis=1)
+    std_per_level = (norms**2).std(axis=1) / norms.shape[1] ** 0.5
+    std_per_level_log_trans = std_per_level / mean_per_level
+    upper = mean_per_level * np.exp(std_per_level / mean_per_level)
+    lower = mean_per_level / np.exp(std_per_level / mean_per_level)
+    levels = range(norms.shape[0])
+    line = plt.plot(levels, mean_per_level)[0]
+    band = plt.fill_between(levels, upper, lower, alpha=0.3)
+    O1 = plt.plot(levels, [mean_per_level[0] * 2 ** (-l) for l in levels], c=tab10(7))[0]
+    O2 = plt.plot(levels, [mean_per_level[0] * 2 ** (-2 * l) for l in levels], c=tab10(7))[0]
+    plt.legend(
+        [(line, band), (O1,), (O2,)],
+        [r"$\mathrm{E}\|\Delta\nabla_\ell \hat F\|^2$", r"$O(2^{-\ell})$", r"$O(2^{-2\ell})$"],
+    )
+    plt.xlabel(r"Level $\ell$")
+    plt.ylabel(
+        r"Trace of the second moment of the coupled gradient estimator $\Delta\nabla_\ell \hat F$"
+    )
+    plt.yscale("log")
+    plt.savefig("./logs/variance_decay.pdf")
 
 
 def main(timestamps: Optional[List[int]] = None) -> None:
@@ -71,7 +110,8 @@ def main(timestamps: Optional[List[int]] = None) -> None:
     array_dict = try_load_arrays(parsed_timestamps)
     array_dict = {k: list(filter(lambda x: x is not None, v)) for k, v in array_dict.items()}
 
-    plot_decays(array_dict)
+    # plot_variance_decay(array_dict)
+    plot_smoothness_decay(array_dict)
     breakpoint()
 
 
