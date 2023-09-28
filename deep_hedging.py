@@ -43,16 +43,16 @@ from mpi4py import MPI
 from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
-# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
 
 T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
 
-BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-3, 1000, 7
-# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-3, 1000, 7
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 3
 
-KEY = jr.PRNGKey(3)
+KEY = jr.PRNGKey(4)
 MU = 1.0
 SIGMA = 1.0
 STRIKE_PRICE = jnp.exp(MU)
@@ -61,9 +61,10 @@ STRIKE_PRICE = jnp.exp(MU)
 N_REPEAT_EXPERIMENT = 1
 COST_RATE = 1
 VARIANCE_DECAY_RATE = 1.2
-# VARIANCE_DECAY_RATE = 2
+# VARIANCE_DECAY_RATE = 1.8  # TODO
 SMOOTHNESS_DECAY_RATE = 1.0
-# SMOOTHNESS_DECAY_RATE = 1
+
+# VALIDATION_CYCLE = 2 ** 5  # TODO
 
 WORLD_RANK = MPI.COMM_WORLD.Get_rank()
 WORLD_SIZE = MPI.COMM_WORLD.Get_size()
@@ -334,7 +335,6 @@ def grad_l2_norm(model: DeepHedgingLoss, keys: PRNGKeyArray, level: int) -> Floa
 
 
 @eqx.filter_jit
-@partial(jax.vmap, in_axes=(None, None, 0, None))
 def grad_diff_l2_norm(
     model0: DeepHedgingLoss, model1: DeepHedgingLoss, keys: PRNGKeyArray, level: int
 ) -> Float[Array, ""]:
@@ -354,16 +354,16 @@ def param_diff_l2_norm(model0: DeepHedgingLoss, model1: DeepHedgingLoss) -> Floa
 
 
 def log_grad_l2_norms(model: DeepHedgingLoss, save_path: Path, key: PRNGKeyArray) -> None:
-    norms_outer = []
+    norms_outer = [None] * (MAX_LEVEL + 1)
     for level in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating variance"):
         norms_inner = []
         for i in trange(2**8, desc=f"Level {level}", leave=False):
             keys_2d = jr.split(jr.fold_in(key, i), (2**8, 1))
             norms_inner.append(grad_l2_norm(model, keys_2d, level))
-        norms_outer.append(jnp.concatenate(norms_inner))
+        norms_outer[level] = jnp.concatenate(norms_inner)
         clear_all_jit_cache()
         jax.lib.xla_bridge.get_backend().defragment()
-    norms = jnp.stack(norms_outer[::-1])
+    norms = jnp.stack(norms_outer)  # type: ignore[arg-type]
     fp = save_path / "grad_l2_norms.npy"
     save_array(norms, fp)
     mlflow.log_artifacts(fp.parent.absolute().as_posix(), fp.name)
@@ -371,21 +371,10 @@ def log_grad_l2_norms(model: DeepHedgingLoss, save_path: Path, key: PRNGKeyArray
 
 @eqx.filter_jit
 def perturb_model(model: DeepHedgingLoss, key: PRNGKeyArray) -> DeepHedgingLoss:
-    keys = jr.split(key, 2**8)
+    keys = jr.split(key, 2**6)
     loss, grad = loss_and_grad(model, keys, 0)
     update = jtu.tree_map(lambda x: -1e-4 * x, grad)
     return eqx.apply_updates(model, update)
-
-
-def get_perturbed_models(
-    model: DeepHedgingLoss, key: PRNGKeyArray, n_models: int
-) -> List[DeepHedgingLoss]:
-    models = []
-    for i in trange(n_models, desc="Perturbing models", leave=False):
-        models.append(perturb_model(model, jr.fold_in(key, i)))
-    clear_all_jit_cache()
-    jax.lib.xla_bridge.get_backend().defragment()
-    return models
 
 
 def log_normalized_grad_diff_l2_norms(
@@ -393,19 +382,21 @@ def log_normalized_grad_diff_l2_norms(
     save_path: Path,
     key: PRNGKeyArray,
 ) -> None:
-    models = get_perturbed_models(model, key, 2**8)
-    norms_outer = []
+    norms_outer = [None] * (MAX_LEVEL + 1)
     for level in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating smoothness"):
         norms_inner = []
-        for i, m in enumerate(tqdm(models, desc=f"Level {level}", leave=False)):
-            keys_2d = jr.split(jr.fold_in(key, i), (2**7, 1))
+        for i in trange(2**8, desc=f"Level {level}", leave=False):
+            key_loop = jr.fold_in(key, i)
+            model_perturbed = perturb_model(model, key_loop)
+            keys = jr.split(key_loop, (2**9,))
             norms_inner.append(
-                grad_diff_l2_norm(model, m, keys_2d, level) / param_diff_l2_norm(model, m)
+                grad_diff_l2_norm(model, model_perturbed, keys, level)
+                / param_diff_l2_norm(model, model_perturbed)
             )
-        norms_outer.append(jnp.stack(norms_inner))
+        norms_outer[level] = jnp.concatenate(norms_inner)
         clear_all_jit_cache()
         jax.lib.xla_bridge.get_backend().defragment()
-    norms = jnp.stack(norms_outer[::-1])
+    norms = jnp.stack(norms_outer)  # type: ignore[arg-type]
     fp = save_path / "normalized_grad_diff_l2_norms.npy"
     save_array(norms, fp)
     mlflow.log_artifacts(fp.parent.absolute().as_posix(), fp.name)
@@ -423,6 +414,8 @@ def step_baseline(
     loss, grad = loss_and_grad_baseline(model, keys, max_level)
     updates, opt_state = optim.update(grad, opt_state)
     model = eqx.apply_updates(model, updates)
+    # TODO:
+    # loss = jnp.mean(batched_loss_baseline(model, jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE), MAX_LEVEL))
     return loss, model, opt_state
 
 
@@ -452,14 +445,17 @@ def step_mlmc(
     for level in range(MAX_LEVEL, -1, -1):
         if WORLD_SIZE != 1 and level != WORLD_RANK:
             continue
+        # batch_size = math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
         batch_size = math.ceil(BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level))
-        keys = jr.split(key, batch_size)
+        keys = jr.split(jr.fold_in(key, level), batch_size)
         loss, grad = loss_and_grad(model, keys, level)
         grad_per_level[level] = grad
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
     if WORLD_SIZE != 1 and WORLD_RANK != 0:
         loss = 0.0
     else:
+        # TODO:
+        # loss = jnp.mean(batched_loss_baseline(model, jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE), MAX_LEVEL))
         loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE), MAX_LEVEL))
     return loss, model, opt_state
 
@@ -482,6 +478,7 @@ def step_delayed_mlmc(
             continue
         if WORLD_SIZE != 1 and level != WORLD_RANK:
             continue
+        # batch_size = math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
         batch_size = math.ceil(BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level))
         keys = jr.split(key, batch_size)
         loss, grad = loss_and_grad(model, keys, level)
@@ -491,6 +488,8 @@ def step_delayed_mlmc(
     if WORLD_SIZE != 1 and WORLD_RANK != 0:
         loss = 0.0
     else:
+        # TODO: I should fix the test data here
+        # loss = jnp.mean(batched_loss_baseline(model, jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE), MAX_LEVEL))
         loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE), MAX_LEVEL))
     return loss, model, opt_state, grad_per_level
 
@@ -505,10 +504,10 @@ def run_deep_hedging() -> None:
     losses_all = []
     times_all = []
     # for method in tqdm(["baseline"]):
-    # for method in tqdm(["mlmc"]):
     # for method in tqdm(["delayed_mlmc"]):
     # for method in tqdm(["delayed_mlmc", "baseline"]):
     for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
+        # for method in tqdm(["mlmc"]):
         losses_outer = []
         times_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
@@ -616,11 +615,11 @@ def examine_mlmc_decay() -> None:
 if __name__ == "__main__":
     logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
-    jax_smi.initialise_tracking()
+    # jax_smi.initialise_tracking()
     # jax.experimental.compilation_cache.compilation_cache.initialize_cache(
     #     "./.compilation_cache"
     # )  # type: ignore[no-untyped-call]
     # jax.experimental.io_callback()
     with jax.disable_jit(False):
-        examine_mlmc_decay()
-        # run_deep_hedging()
+        # examine_mlmc_decay()
+        run_deep_hedging()
