@@ -43,28 +43,26 @@ from mpi4py import MPI
 from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
-# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
 
 T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
 
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-3, 1000, 7
-# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
-BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 1
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 1
 
-KEY = jr.PRNGKey(4)
+KEY = jr.PRNGKey(10)
 MU = 1.0
 SIGMA = 1.0
 STRIKE_PRICE = jnp.exp(MU)
 
-# N_REPEAT_EXPERIMENT = 10
 N_REPEAT_EXPERIMENT = 1
 COST_RATE = 1
-VARIANCE_DECAY_RATE = 1.2
-# VARIANCE_DECAY_RATE = 1.8  # TODO
+VARIANCE_DECAY_RATE = 1.8
 SMOOTHNESS_DECAY_RATE = 1.0
 
-# VALIDATION_CYCLE = 2 ** 5  # TODO
+VALIDATION_CYCLE = 2**5
 
 WORLD_RANK = MPI.COMM_WORLD.Get_rank()
 WORLD_SIZE = MPI.COMM_WORLD.Get_size()
@@ -244,7 +242,6 @@ class DeepHedgingLoss(eqx.Module):
     ) -> Float[Array, ""]:
         terms = MultiTerm(ODETerm(self.drift), ControlTerm(self.diffusion, bm))
         solver = ItoMilstein()
-        # solver = Euler()
         saveat = SaveAt(t1=True)
         stepto = StepTo(ts)
         y0 = jnp.array([1.0, 0.0])
@@ -409,13 +406,18 @@ def step_baseline(
     opt_state: optax.OptState,
     key: PRNGKeyArray,
     max_level: int,
+    step: int,
 ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
     keys = jr.split(key, BATCH_SIZE)
     loss, grad = loss_and_grad_baseline(model, keys, max_level)
     updates, opt_state = optim.update(grad, opt_state)
     model = eqx.apply_updates(model, updates)
     # TODO:
-    # loss = jnp.mean(batched_loss_baseline(model, jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE), MAX_LEVEL))
+    loss = jnp.mean(
+        batched_loss_baseline(
+            model, jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE), MAX_LEVEL
+        )
+    )
     return loss, model, opt_state
 
 
@@ -440,13 +442,13 @@ def step_mlmc(
     optim: optax.GradientTransformation,
     opt_state: optax.OptState,
     key: PRNGKeyArray,
+    step: int,
 ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
     grad_per_level = [None] * (MAX_LEVEL + 1)
     for level in range(MAX_LEVEL, -1, -1):
         if WORLD_SIZE != 1 and level != WORLD_RANK:
             continue
-        # batch_size = math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
-        batch_size = math.ceil(BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level))
+        batch_size = math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
         keys = jr.split(jr.fold_in(key, level), batch_size)
         loss, grad = loss_and_grad(model, keys, level)
         grad_per_level[level] = grad
@@ -454,9 +456,11 @@ def step_mlmc(
     if WORLD_SIZE != 1 and WORLD_RANK != 0:
         loss = 0.0
     else:
-        # TODO:
-        # loss = jnp.mean(batched_loss_baseline(model, jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE), MAX_LEVEL))
-        loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE), MAX_LEVEL))
+        loss = jnp.mean(
+            batched_loss_baseline(
+                model, jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE), MAX_LEVEL
+            )
+        )
     return loss, model, opt_state
 
 
@@ -469,7 +473,6 @@ def step_delayed_mlmc(
     step: int,
 ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState, List[DeepHedgingLoss]]:
     keys = jr.split(key, BATCH_SIZE)
-    # periods = [math.ceil(2 ** (SMOOTHNESS_DECAY_RATE * l)) for l in range(MAX_LEVEL + 1)]
     periods = [
         math.floor(2 ** (1 + SMOOTHNESS_DECAY_RATE * (level - 1))) for level in range(MAX_LEVEL + 1)
     ]
@@ -478,8 +481,7 @@ def step_delayed_mlmc(
             continue
         if WORLD_SIZE != 1 and level != WORLD_RANK:
             continue
-        # batch_size = math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
-        batch_size = math.ceil(BATCH_SIZE // 2 ** ((VARIANCE_DECAY_RATE - COST_RATE) * level))
+        batch_size = math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
         keys = jr.split(key, batch_size)
         loss, grad = loss_and_grad(model, keys, level)
         grad_per_level[level] = grad
@@ -488,9 +490,11 @@ def step_delayed_mlmc(
     if WORLD_SIZE != 1 and WORLD_RANK != 0:
         loss = 0.0
     else:
-        # TODO: I should fix the test data here
-        # loss = jnp.mean(batched_loss_baseline(model, jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE), MAX_LEVEL))
-        loss = jnp.mean(batched_loss_baseline(model, jr.split(key, BATCH_SIZE), MAX_LEVEL))
+        loss = jnp.mean(
+            batched_loss_baseline(
+                model, jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE), MAX_LEVEL
+            )
+        )
     return loss, model, opt_state, grad_per_level
 
 
@@ -541,10 +545,12 @@ def run_deep_hedging() -> None:
                     match method:
                         case "baseline":
                             loss, model, opt_state = step_baseline(
-                                model, optim, opt_state, key_inner, MAX_LEVEL
+                                model, optim, opt_state, key_inner, MAX_LEVEL, i
                             )
                         case "mlmc":
-                            loss, model, opt_state = step_mlmc(model, optim, opt_state, key_inner)
+                            loss, model, opt_state = step_mlmc(
+                                model, optim, opt_state, key_inner, i
+                            )
                         case "delayed_mlmc":
                             loss, model, opt_state, grad_per_level = step_delayed_mlmc(
                                 model, optim, opt_state, grad_per_level, key_inner, i
