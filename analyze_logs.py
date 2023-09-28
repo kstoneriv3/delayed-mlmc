@@ -3,7 +3,7 @@ import os
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, cast
 
 import fire
 import matplotlib.pyplot as plt
@@ -84,8 +84,10 @@ def plot_variance_decay(array_dict: ArrayDict) -> None:
 
 
 def plot_smoothness_decay(array_dict: ArrayDict) -> None:
-    norms = array_dict["diff_norms_after"][0]
+    norms = cast(np.ndarray, array_dict["diff_norms_after"][0])
     assert isinstance(norms, np.ndarray)
+    if len(norms.shape) == 3:
+        norms = np.mean(norms, axis=2)  # TODO: remove
     mean_per_level = norms.mean(axis=1)
     std_per_level = norms.std(axis=1) / norms.shape[1] ** 0.5
     std_per_level_log_trans = std_per_level / mean_per_level
@@ -205,7 +207,7 @@ def main(timestamps: Optional[List[int]] = None) -> None:
     array_dict = {k: list(filter(lambda x: x is not None, v)) for k, v in array_dict.items()}
 
     # plot_variance_decay(array_dict)
-    # plot_smoothness_decay(array_dict)
+    plot_smoothness_decay(array_dict)
     # plot_learning_curves(array_dict)
 
 

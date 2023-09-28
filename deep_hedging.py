@@ -43,14 +43,14 @@ from mpi4py import MPI
 from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
-jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
 
 T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
 
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-3, 1000, 7
-BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
-# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 3
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 1
 
 KEY = jr.PRNGKey(4)
 MU = 1.0
@@ -393,7 +393,7 @@ def log_normalized_grad_diff_l2_norms(
                 grad_diff_l2_norm(model, model_perturbed, keys, level)
                 / param_diff_l2_norm(model, model_perturbed)
             )
-        norms_outer[level] = jnp.concatenate(norms_inner)
+        norms_outer[level] = jnp.stack(norms_inner)
         clear_all_jit_cache()
         jax.lib.xla_bridge.get_backend().defragment()
     norms = jnp.stack(norms_outer)  # type: ignore[arg-type]
@@ -621,5 +621,5 @@ if __name__ == "__main__":
     # )  # type: ignore[no-untyped-call]
     # jax.experimental.io_callback()
     with jax.disable_jit(False):
-        # examine_mlmc_decay()
-        run_deep_hedging()
+        examine_mlmc_decay()
+        # run_deep_hedging()
