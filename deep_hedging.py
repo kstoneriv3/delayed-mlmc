@@ -17,7 +17,6 @@ import jax.numpy as jnp
 import jax.random as jr
 import jax.tree_util as jtu
 import jax_smi
-import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import optax
@@ -375,7 +374,7 @@ def step_baseline(
     loss, grad = loss_and_grad_baseline(model, keys, max_level)
     updates, opt_state = optim.update(grad, opt_state)
     model = eqx.apply_updates(model, updates)
-    keys_loss = jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE)
+    keys_loss = jr.split(jr.fold_in(KEY, step % VALIDATION_CYCLE), BATCH_SIZE)
     loss = jnp.mean(batched_loss_baseline(model, keys_loss, MAX_LEVEL))
     return loss, model, opt_state
 
@@ -407,7 +406,7 @@ def step_mlmc(
         loss, grad = loss_and_grad(model, keys, level)
         grad_per_level[level] = grad
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
-    keys_loss = jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE)
+    keys_loss = jr.split(jr.fold_in(KEY, step % VALIDATION_CYCLE), BATCH_SIZE)
     loss = jnp.mean(batched_loss_baseline(model, keys_loss, MAX_LEVEL))
     return loss, model, opt_state
 
@@ -433,7 +432,7 @@ def step_delayed_mlmc(
         grad_per_level[level] = grad
 
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
-    keys_loss = jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE)
+    keys_loss = jr.split(jr.fold_in(KEY, step % VALIDATION_CYCLE), BATCH_SIZE)
     loss = jnp.mean(batched_loss_baseline(model, keys_loss, MAX_LEVEL))
     return loss, model, opt_state, grad_per_level
 
@@ -556,5 +555,5 @@ if __name__ == "__main__":
     logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
     with jax.disable_jit(False):
-        examine_mlmc_decay()
-        # run_deep_hedging()
+        run_deep_hedging()
+        # examine_mlmc_decay()
