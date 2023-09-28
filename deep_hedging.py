@@ -10,9 +10,6 @@ from typing import Any, Callable, List, Optional, ParamSpec, Tuple, Union, cast
 
 # Showing the compilation logs
 os.environ["JAX_LOG_COMPILES"] = "1"  # noqa
-# The below does not work as it just emulates devices for debugging purpose.
-# It seems that only way to use multiprocessing with jax is manual MPI by mpi4jax.
-# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=7"
 
 import equinox as eqx
 import jax
@@ -22,7 +19,6 @@ import jax.tree_util as jtu
 import jax_smi
 import matplotlib.pyplot as plt
 import mlflow
-import mpi4jax
 import numpy as np
 import optax
 import polars as pl
@@ -39,7 +35,6 @@ from diffrax import (
 )
 from diffrax.custom_types import Int, Scalar
 from jaxtyping import Array, Float, PRNGKeyArray, PyTree
-from mpi4py import MPI
 from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
@@ -62,12 +57,7 @@ COST_RATE = 1
 VARIANCE_DECAY_RATE = 1.8
 SMOOTHNESS_DECAY_RATE = 1.0
 
-VALIDATION_CYCLE = 2**5
-
-WORLD_RANK = MPI.COMM_WORLD.Get_rank()
-WORLD_SIZE = MPI.COMM_WORLD.Get_size()
-
-assert WORLD_SIZE == 1 or WORLD_SIZE == MAX_LEVEL + 1
+VALIDATION_CYCLE = 2**6
 
 
 @contextmanager  # type: ignore[arg-type]
@@ -79,25 +69,11 @@ def nullfunc(*args: Any, **kwargs: Any) -> None:
     pass
 
 
-if WORLD_RANK != 0:
-    mlflow.start_run = nullcontext
-    mlflow.log_params = nullfunc
-    mlflow.log_metric = nullfunc
-    mlflow.set_experiment = nullfunc
-
-
-def mpi_breakpoint(rank: int = 0) -> None:
-    if WORLD_RANK == rank:
-        breakpoint()  # noqa
-
-
 def get_timestamp() -> str:
     return datetime.now().strftime("%Y%m%d%H%M%S")
 
 
 def save_array(array: Array, path: Path) -> None:
-    if WORLD_RANK != 0:
-        return
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, array)
 
@@ -114,13 +90,6 @@ def sum_if_arrays(*args: Array) -> Array:
 
 def tree_sum(trees: List[PyTree]) -> PyTree:
     return jtu.tree_map(sum_if_arrays, *trees)
-
-
-def tree_mpi_reduce_sum(trees: List[PyTree]) -> PyTree:
-    assert len(trees) == WORLD_SIZE
-    tree = trees[WORLD_RANK]
-    mpi_reduce_sum = lambda x: mpi4jax.allreduce(x, op=MPI.SUM, comm=MPI.COMM_WORLD)[0]  # noqa
-    return jtu.tree_map(mpi_reduce_sum, tree)
 
 
 def clear_all_jit_cache() -> None:
@@ -266,8 +235,6 @@ class DeepHedgingLoss(eqx.Module):
 
 
 def save_model_weight(model: DeepHedgingLoss, path: Path) -> None:
-    if WORLD_RANK != 0:
-        return
     path.parent.mkdir(parents=True, exist_ok=True)
     eqx.tree_serialise_leaves(path, model)
     mlflow.log_artifacts(path.parent.absolute().as_posix(), path.name)
@@ -282,7 +249,6 @@ def load_model_weight(model: DeepHedgingLoss, path: Path) -> DeepHedgingLoss:
 def batched_loss_baseline(
     model: DeepHedgingLoss, key: PRNGKeyArray, max_level: int
 ) -> Float[Array, ""]:
-    # bm = VirtualBrownianTree(T0, T1, tol=0.001, shape=(DIM,), key=key)
     n_steps = N_STEPS_LEVEL0 * 2**max_level
     bm = FixedBrownianMotion.create_from_interval(T0, T1, n_steps, DIM, key)
     ts = (T1 - T0) * jnp.arange(n_steps + 1) / n_steps + T0
@@ -302,14 +268,11 @@ def loss_and_grad_baseline(
 def batched_loss(model: DeepHedgingLoss, key: PRNGKeyArray, level: int) -> Float[Array, ""]:
     n_steps = N_STEPS_LEVEL0 * 2**level
     bm = FixedBrownianMotion.create_from_interval(T0, T1, n_steps, DIM, key)
-    # bm = VirtualBrownianTree(T0, T1, tol=0.001, shape=(DIM,), key=key)
-    # abm = bm.to_antithetic_path()
     ts = (T1 - T0) * jnp.arange(n_steps + 1) / n_steps + T0
     ts_coarse = ts[::2]
     if level == 0:
         return model(bm, ts)
     else:
-        # return (model(bm, ts) + model(abm, ts)) / 2 - model(bm, ts_coarse)
         return model(bm, ts) - model(bm, ts_coarse)
 
 
@@ -412,12 +375,8 @@ def step_baseline(
     loss, grad = loss_and_grad_baseline(model, keys, max_level)
     updates, opt_state = optim.update(grad, opt_state)
     model = eqx.apply_updates(model, updates)
-    # TODO:
-    loss = jnp.mean(
-        batched_loss_baseline(
-            model, jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE), MAX_LEVEL
-        )
-    )
+    keys_loss = jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE)
+    loss = jnp.mean(batched_loss_baseline(model, keys_loss, MAX_LEVEL))
     return loss, model, opt_state
 
 
@@ -428,10 +387,7 @@ def _step_from_grad_per_level(
     opt_state: optax.OptState,
     grad_per_level: List[DeepHedgingLoss],
 ) -> Tuple[DeepHedgingLoss, optax.OptState]:
-    if WORLD_SIZE == 1:
-        grad_sum = tree_sum(grad_per_level)
-    else:
-        grad_sum = tree_mpi_reduce_sum(grad_per_level)
+    grad_sum = tree_sum(grad_per_level)
     updates, opt_state = optim.update(grad_sum, opt_state)
     model = eqx.apply_updates(model, updates)
     return model, opt_state
@@ -446,21 +402,13 @@ def step_mlmc(
 ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
     grad_per_level = [None] * (MAX_LEVEL + 1)
     for level in range(MAX_LEVEL, -1, -1):
-        if WORLD_SIZE != 1 and level != WORLD_RANK:
-            continue
         batch_size = math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
         keys = jr.split(jr.fold_in(key, level), batch_size)
         loss, grad = loss_and_grad(model, keys, level)
         grad_per_level[level] = grad
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
-    if WORLD_SIZE != 1 and WORLD_RANK != 0:
-        loss = 0.0
-    else:
-        loss = jnp.mean(
-            batched_loss_baseline(
-                model, jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE), MAX_LEVEL
-            )
-        )
+    keys_loss = jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE)
+    loss = jnp.mean(batched_loss_baseline(model, keys_loss, MAX_LEVEL))
     return loss, model, opt_state
 
 
@@ -479,22 +427,14 @@ def step_delayed_mlmc(
     for level in range(MAX_LEVEL, -1, -1):
         if step % periods[level] != 0:
             continue
-        if WORLD_SIZE != 1 and level != WORLD_RANK:
-            continue
         batch_size = math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
         keys = jr.split(key, batch_size)
         loss, grad = loss_and_grad(model, keys, level)
         grad_per_level[level] = grad
 
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
-    if WORLD_SIZE != 1 and WORLD_RANK != 0:
-        loss = 0.0
-    else:
-        loss = jnp.mean(
-            batched_loss_baseline(
-                model, jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE), MAX_LEVEL
-            )
-        )
+    keys_loss = jr.split(jr.fold_in(key, step % VALIDATION_CYCLE), BATCH_SIZE)
+    loss = jnp.mean(batched_loss_baseline(model, keys_loss, MAX_LEVEL))
     return loss, model, opt_state, grad_per_level
 
 
@@ -508,10 +448,10 @@ def run_deep_hedging() -> None:
     losses_all = []
     times_all = []
     # for method in tqdm(["baseline"]):
+    # for method in tqdm(["mlmc"]):
     # for method in tqdm(["delayed_mlmc"]):
     # for method in tqdm(["delayed_mlmc", "baseline"]):
     for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
-        # for method in tqdm(["mlmc"]):
         losses_outer = []
         times_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
@@ -576,20 +516,14 @@ def examine_mlmc_decay() -> None:
     """Record the variance and smoothness per level during the optimization."""
     mlflow.set_experiment("examine_mlmc_decay")
 
-    # timestamp = get_timestamp()
-    timestamp = "20230928004907"
+    timestamp = get_timestamp()
 
     save_path = Path("./logs") / timestamp
     key, model_key = jr.split(KEY, 2)
     model = model_prev = DeepHedgingLoss.create_from_dim_and_key(DIM, model_key)
 
-    load_model_weight(model, save_path / "model.eqx")
-    log_normalized_grad_diff_l2_norms(model, save_path / "after", key)
-    log_grad_l2_norms(model, save_path / "after", key)
-    exit()
-
-    # log_normalized_grad_diff_l2_norms(model, save_path / "before", key)
-    # log_grad_l2_norms(model, save_path / "before", key)
+    log_normalized_grad_diff_l2_norms(model, save_path / "before", key)
+    log_grad_l2_norms(model, save_path / "before", key)
 
     with mlflow.start_run():
         global_params = {
@@ -621,11 +555,6 @@ def examine_mlmc_decay() -> None:
 if __name__ == "__main__":
     logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
-    # jax_smi.initialise_tracking()
-    # jax.experimental.compilation_cache.compilation_cache.initialize_cache(
-    #     "./.compilation_cache"
-    # )  # type: ignore[no-untyped-call]
-    # jax.experimental.io_callback()
     with jax.disable_jit(False):
         examine_mlmc_decay()
         # run_deep_hedging()
