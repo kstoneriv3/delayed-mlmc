@@ -43,17 +43,16 @@ from mpi4py import MPI
 from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
-jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
 
 T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
 
-# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 2e-3, 1000, 7
-BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
-# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-4, 4000, 5
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-3, 1000, 7
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 3
 
-KEY = jr.PRNGKey(2)
+KEY = jr.PRNGKey(3)
 MU = 1.0
 SIGMA = 1.0
 STRIKE_PRICE = jnp.exp(MU)
@@ -98,9 +97,10 @@ def get_timestamp() -> str:
 
 
 def save_array(array: Array, path: Path) -> None:
-    if WORLD_RANK == 0:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(path, array)
+    if WORLD_RANK != 0:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, array)
 
 
 def tree_zeros_like(tree: PyTree) -> PyTree:
@@ -122,6 +122,14 @@ def tree_mpi_reduce_sum(trees: List[PyTree]) -> PyTree:
     tree = trees[WORLD_RANK]
     mpi_reduce_sum = lambda x: mpi4jax.allreduce(x, op=MPI.SUM, comm=MPI.COMM_WORLD)[0]  # noqa
     return jtu.tree_map(mpi_reduce_sum, tree)
+
+
+def clear_all_jit_cache() -> None:
+    for k, v in globals().items():
+        try:
+            v._cached._clear_cache()
+        except:
+            pass
 
 
 class FixedBrownianMotion(AbstractBrownianPath):
@@ -259,6 +267,18 @@ class DeepHedgingLoss(eqx.Module):
         return J
 
 
+def save_model_weight(model: DeepHedgingLoss, path: Path) -> None:
+    if WORLD_RANK != 0:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    eqx.tree_serialise_leaves(path, model)
+    mlflow.log_artifacts(path.parent.absolute().as_posix(), path.name)
+
+
+def load_model_weight(model: DeepHedgingLoss, path: Path) -> DeepHedgingLoss:
+    return eqx.tree_deserialise_leaves(path, model)
+
+
 @eqx.filter_jit
 @partial(jax.vmap, in_axes=(None, 0, None))
 def batched_loss_baseline(
@@ -338,12 +358,15 @@ def log_grad_l2_norms(model: DeepHedgingLoss, save_path: Path, key: PRNGKeyArray
     for level in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating variance"):
         norms_inner = []
         for i in trange(2**8, desc=f"Level {level}", leave=False):
-            keys_2d = jr.split(jr.fold_in(key, 2**8 * level + i), (2**8, 1))
+            keys_2d = jr.split(jr.fold_in(key, i), (2**8, 1))
             norms_inner.append(grad_l2_norm(model, keys_2d, level))
         norms_outer.append(jnp.concatenate(norms_inner))
-        grad_l2_norm._cached._clear_cache()
-    norms = jnp.stack(norms_outer)
-    save_array(norms, save_path / "grad_l2_norms.npy")
+        clear_all_jit_cache()
+        jax.lib.xla_bridge.get_backend().defragment()
+    norms = jnp.stack(norms_outer[::-1])
+    fp = save_path / "grad_l2_norms.npy"
+    save_array(norms, fp)
+    mlflow.log_artifacts(fp.parent.absolute().as_posix(), fp.name)
 
 
 @eqx.filter_jit
@@ -358,9 +381,10 @@ def get_perturbed_models(
     model: DeepHedgingLoss, key: PRNGKeyArray, n_models: int
 ) -> List[DeepHedgingLoss]:
     models = []
-    for i in trange(2**5, desc="Perturbing models", leave=False):
+    for i in trange(n_models, desc="Perturbing models", leave=False):
         models.append(perturb_model(model, jr.fold_in(key, i)))
-    perturb_model._cached._clear_cache()
+    clear_all_jit_cache()
+    jax.lib.xla_bridge.get_backend().defragment()
     return models
 
 
@@ -369,19 +393,22 @@ def log_normalized_grad_diff_l2_norms(
     save_path: Path,
     key: PRNGKeyArray,
 ) -> None:
-    models = get_perturbed_models(model, key, 2**8)
+    models = get_perturbed_models(model, key, 2**6)
     norms_outer = []
     for level in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating smoothness"):
         norms_inner = []
         for i, m in enumerate(tqdm(models, desc=f"Level {level}", leave=False)):
-            keys_2d = jr.split(jr.fold_in(key, 2**8 * level + i), (2**7, 1))
+            keys_2d = jr.split(jr.fold_in(key, i), (2**7, 1))
             norms_inner.append(
                 grad_diff_l2_norm(model, m, keys_2d, level) / param_diff_l2_norm(model, m)
             )
         norms_outer.append(jnp.stack(norms_inner))
-        grad_diff_l2_norm._cached._clear_cache()
-    norms = jnp.stack(norms_outer)
-    save_array(norms, save_path / "normalized_grad_diff_l2_norms.npy")
+        clear_all_jit_cache()
+        jax.lib.xla_bridge.get_backend().defragment()
+    norms = jnp.stack(norms_outer[::-1])
+    fp = save_path / "normalized_grad_diff_l2_norms.npy"
+    save_array(norms, fp)
+    mlflow.log_artifacts(fp.parent.absolute().as_posix(), fp.name)
 
 
 @eqx.filter_jit
@@ -478,9 +505,10 @@ def run_deep_hedging() -> None:
     losses_all = []
     times_all = []
     # for method in tqdm(["baseline"]):
-    # for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
-    # for method in tqdm(["mlmc", "delayed_mlmc"]):
-    for method in tqdm(["mlmc"]):
+    # for method in tqdm(["mlmc"]):
+    # for method in tqdm(["delayed_mlmc"]):
+    # for method in tqdm(["delayed_mlmc", "baseline"]):
+    for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
         losses_outer = []
         times_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
@@ -528,6 +556,7 @@ def run_deep_hedging() -> None:
                     mlflow.log_metric("loss", float(loss), i)
                 losses_outer.append(jnp.stack(losses_inner))
                 times_outer.append(jnp.stack(losses_inner))
+                save_model_weight(model, save_path / f"model_{method}_{i}.eqx")
 
         save_array(jnp.stack(losses_outer), save_path / f"losses_{method}.npy")
         save_array(jnp.stack(times_outer), save_path / f"times_{method}.npy")
@@ -541,10 +570,17 @@ def run_deep_hedging() -> None:
 def examine_mlmc_decay() -> None:
     """Record the variance and smoothness per level during the optimization."""
     mlflow.set_experiment("examine_mlmc_decay")
-    timestamp = get_timestamp()
+
+    # timestamp = get_timestamp()
+    timestamp = "20230928004907"
+
     save_path = Path("./logs") / timestamp
     key, model_key = jr.split(KEY, 2)
     model = model_prev = DeepHedgingLoss.create_from_dim_and_key(DIM, model_key)
+
+    load_model_weight(model, save_path / "model.eqx")
+    log_grad_l2_norms(model, save_path / "after", key)
+    exit()
 
     # log_normalized_grad_diff_l2_norms(model, save_path / "before", key)
     # log_grad_l2_norms(model, save_path / "before", key)
@@ -570,20 +606,20 @@ def examine_mlmc_decay() -> None:
             mlflow.log_metric("loss", float(loss), i)
 
         save_array(jnp.stack(losses), save_path / "losses.npy")
-        step_baseline._cached._clear_cache()
+        save_model_weight(model, save_path / "model.eqx")
 
-        log_normalized_grad_diff_l2_norms(model, save_path / "after", key)
         log_grad_l2_norms(model, save_path / "after", key)
+        log_normalized_grad_diff_l2_norms(model, save_path / "after", key)
 
 
 if __name__ == "__main__":
     logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
-    # jax_smi.initialise_tracking()
+    jax_smi.initialise_tracking()
     # jax.experimental.compilation_cache.compilation_cache.initialize_cache(
     #     "./.compilation_cache"
     # )  # type: ignore[no-untyped-call]
     # jax.experimental.io_callback()
     with jax.disable_jit(False):
-        # examine_mlmc_decay()
-        run_deep_hedging()
+        examine_mlmc_decay()
+        # run_deep_hedging()
