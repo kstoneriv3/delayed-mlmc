@@ -16,11 +16,9 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 import jax.tree_util as jtu
-import jax_smi
 import mlflow
 import numpy as np
 import optax
-import polars as pl
 from diffrax import (
     AbstractBrownianPath,
     ControlTerm,
@@ -37,7 +35,7 @@ from jaxtyping import Array, Float, PRNGKeyArray, PyTree
 from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
-jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
 
 T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
@@ -56,7 +54,22 @@ COST_RATE = 1
 VARIANCE_DECAY_RATE = 1.8
 SMOOTHNESS_DECAY_RATE = 1.0
 
-VALIDATION_CYCLE = 2**6
+LEVELS = [l for l in range(1 + MAX_LEVEL)]
+PERIOD_PER_LEVEL = [math.floor(2 ** (1 + SMOOTHNESS_DECAY_RATE * (l - 1))) for l in LEVELS]
+BATCH_SIZE_PER_LEVEL = [
+    math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * l)) for l in LEVELS
+]
+COST_PER_LEVEL = [
+    2 ** (COST_RATE * l) * b / BATCH_SIZE for b, l in zip(BATCH_SIZE_PER_LEVEL, LEVELS)
+]
+VARIANCE_PER_LEVEL = [
+    2 ** (-VARIANCE_DECAY_RATE * l) * BATCH_SIZE / b for b, l in zip(BATCH_SIZE_PER_LEVEL, LEVELS)
+]
+TOTAL_MLMC_COST = sum(COST_PER_LEVEL)
+TOTAL_MLMC_VARIANCE = sum(VARIANCE_PER_LEVEL)
+TOTAL_BASELINE_COST = 2**MAX_LEVEL / TOTAL_MLMC_VARIANCE
+
+VALIDATION_CYCLE = 2**MAX_LEVEL
 
 
 @contextmanager  # type: ignore[arg-type]
@@ -314,7 +327,7 @@ def param_diff_l2_norm(model0: DeepHedgingLoss, model1: DeepHedgingLoss) -> Floa
 
 def log_grad_l2_norms(model: DeepHedgingLoss, save_path: Path, key: PRNGKeyArray) -> None:
     norms_outer = [None] * (MAX_LEVEL + 1)
-    for level in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating variance"):
+    for level in tqdm(reversed(LEVELS), desc=f"Evaluating variance"):
         norms_inner = []
         for i in trange(2**8, desc=f"Level {level}", leave=False):
             keys_2d = jr.split(jr.fold_in(key, i), (2**8, 1))
@@ -342,7 +355,7 @@ def log_normalized_grad_diff_l2_norms(
     key: PRNGKeyArray,
 ) -> None:
     norms_outer = [None] * (MAX_LEVEL + 1)
-    for level in trange(MAX_LEVEL, -1, -1, desc=f"Evaluating smoothness"):
+    for level in tqdm(reversed(LEVELS), desc=f"Evaluating smoothness"):
         norms_inner = []
         for i in trange(2**8, desc=f"Level {level}", leave=False):
             key_loop = jr.fold_in(key, i)
@@ -370,7 +383,7 @@ def step_baseline(
     max_level: int,
     step: int,
 ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
-    keys = jr.split(key, BATCH_SIZE)
+    keys = jr.split(key, math.ceil(BATCH_SIZE / TOTAL_MLMC_VARIANCE))  # To match variance with MLMC
     loss, grad = loss_and_grad_baseline(model, keys, max_level)
     updates, opt_state = optim.update(grad, opt_state)
     model = eqx.apply_updates(model, updates)
@@ -400,7 +413,7 @@ def step_mlmc(
     step: int,
 ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
     grad_per_level = [None] * (MAX_LEVEL + 1)
-    for level in range(MAX_LEVEL, -1, -1):
+    for level in reversed(LEVELS):
         batch_size = math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
         keys = jr.split(jr.fold_in(key, level), batch_size)
         loss, grad = loss_and_grad(model, keys, level)
@@ -420,10 +433,8 @@ def step_delayed_mlmc(
     step: int,
 ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState, List[DeepHedgingLoss]]:
     keys = jr.split(key, BATCH_SIZE)
-    periods = [
-        math.floor(2 ** (1 + SMOOTHNESS_DECAY_RATE * (level - 1))) for level in range(MAX_LEVEL + 1)
-    ]
-    for level in range(MAX_LEVEL, -1, -1):
+    periods = [math.floor(2 ** (1 + SMOOTHNESS_DECAY_RATE * (level - 1))) for level in LEVELS]
+    for level in reversed(LEVELS):
         if step % periods[level] != 0:
             continue
         batch_size = math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
@@ -444,13 +455,12 @@ def run_deep_hedging() -> None:
     timestamp = get_timestamp()
     save_path = Path("./logs") / timestamp
 
-    losses_all = []
-    times_all = []
     # for method in tqdm(["baseline"]):
     # for method in tqdm(["mlmc"]):
     # for method in tqdm(["delayed_mlmc"]):
     # for method in tqdm(["delayed_mlmc", "baseline"]):
-    for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
+    # for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
+    for method in tqdm(["baseline"]):
         losses_outer = []
         times_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
@@ -461,9 +471,7 @@ def run_deep_hedging() -> None:
             optim = optax.sgd(LR)
             opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
             if method == "delayed_mlmc":
-                grad_per_level = [
-                    tree_zeros_like(eqx.filter(model, eqx.is_array)) for _ in range(MAX_LEVEL + 1)
-                ]
+                grad_per_level = [tree_zeros_like(eqx.filter(model, eqx.is_array)) for _ in LEVELS]
 
             losses_inner = []
             times_inner = []
@@ -504,11 +512,6 @@ def run_deep_hedging() -> None:
 
         save_array(jnp.stack(losses_outer), save_path / f"losses_{method}.npy")
         save_array(jnp.stack(times_outer), save_path / f"times_{method}.npy")
-        losses_all.append(jnp.stack(losses_outer))
-        times_all.append(jnp.stack(times_outer))
-
-    save_array(jnp.stack(losses_all), save_path / f"losses_all.npy")
-    save_array(jnp.stack(times_all), save_path / f"times_all.npy")
 
 
 def examine_mlmc_decay() -> None:
@@ -555,5 +558,7 @@ if __name__ == "__main__":
     logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
     with jax.disable_jit(False):
-        run_deep_hedging()
+        for k in range(3):
+            KEY = jr.PRNGKey(20 + k)
+            run_deep_hedging()
         # examine_mlmc_decay()

@@ -113,16 +113,25 @@ def plot_smoothness_decay(array_dict: ArrayDict) -> None:
 MAX_LEVEL = 6
 LEVELS = [i for i in range(1 + MAX_LEVEL)]
 BATCH_SIZE = 2**9
-COST_RATE = 1.0
+COST_RATE = 1
+VARIANCE_DECAY_RATE = 1.8
 SMOOTHNESS_DECAY_RATE = 1.0
-VARIANCE_DECAY_RATE = 1.8  # TODO
-PERIOD_PER_LEVEL = [math.floor(2 ** (1 + SMOOTHNESS_DECAY_RATE * (level - 1))) for level in LEVELS]
-COST_PER_LEVEL = [
-    2**level
-    * math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
-    / BATCH_SIZE
-    for level in LEVELS
+
+PERIOD_PER_LEVEL = [math.floor(2 ** (1 + SMOOTHNESS_DECAY_RATE * (l - 1))) for l in LEVELS]
+BATCH_SIZE_PER_LEVEL = [
+    math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * l)) for l in LEVELS
 ]
+COST_PER_LEVEL = [
+    2 ** (COST_RATE * l) * b / BATCH_SIZE for b, l in zip(BATCH_SIZE_PER_LEVEL, LEVELS)
+]
+VARIANCE_PER_LEVEL = [
+    2 ** (-VARIANCE_DECAY_RATE * l) * BATCH_SIZE / b for b, l in zip(BATCH_SIZE_PER_LEVEL, LEVELS)
+]
+TOTAL_MLMC_COST = sum(COST_PER_LEVEL)
+TOTAL_MLMC_VARIANCE = sum(VARIANCE_PER_LEVEL)
+TOTAL_BASELINE_COST = 2**MAX_LEVEL / TOTAL_MLMC_VARIANCE
+
+VALIDATION_CYCLE = 2**MAX_LEVEL
 
 
 def apply_smoothing(signal: np.ndarray) -> np.ndarray:
@@ -148,8 +157,8 @@ def plot_learning_curves(array_dict: ArrayDict) -> None:
         [mean_base, mean_mlmc, mean_dmlmc, std_base, std_mlmc, std_dmlmc],
     )
 
-    tot_cost_base = np.cumsum([2**MAX_LEVEL for step in range(losses_base.shape[1])])
-    tot_cost_mlmc = np.cumsum([sum(COST_PER_LEVEL) for step in range(losses_mlmc.shape[1])])
+    tot_cost_base = np.cumsum([TOTAL_BASELINE_COST for step in range(losses_base.shape[1])])
+    tot_cost_mlmc = np.cumsum([TOTAL_MLMC_COST for step in range(losses_mlmc.shape[1])])
     tot_cost_dmlmc = np.cumsum(
         [
             sum(COST_PER_LEVEL[l] for l in LEVELS if step % PERIOD_PER_LEVEL[l] == 0)
