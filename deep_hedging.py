@@ -35,7 +35,7 @@ from jaxtyping import Array, Float, PRNGKeyArray, PyTree
 from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
-# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
 
 T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
@@ -381,14 +381,11 @@ def step_baseline(
     opt_state: optax.OptState,
     key: PRNGKeyArray,
     max_level: int,
-    step: int,
 ) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
     keys = jr.split(key, math.ceil(BATCH_SIZE / TOTAL_MLMC_VARIANCE))  # To match variance with MLMC
     loss, grad = loss_and_grad_baseline(model, keys, max_level)
     updates, opt_state = optim.update(grad, opt_state)
     model = eqx.apply_updates(model, updates)
-    keys_loss = jr.split(jr.fold_in(KEY, step % VALIDATION_CYCLE), BATCH_SIZE)
-    loss = jnp.mean(batched_loss_baseline(model, keys_loss, MAX_LEVEL))
     return loss, model, opt_state
 
 
@@ -410,8 +407,7 @@ def step_mlmc(
     optim: optax.GradientTransformation,
     opt_state: optax.OptState,
     key: PRNGKeyArray,
-    step: int,
-) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState]:
+) -> Tuple[DeepHedgingLoss, optax.OptState]:
     grad_per_level = [None] * (MAX_LEVEL + 1)
     for level in reversed(LEVELS):
         batch_size = math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
@@ -419,9 +415,7 @@ def step_mlmc(
         loss, grad = loss_and_grad(model, keys, level)
         grad_per_level[level] = grad
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
-    keys_loss = jr.split(jr.fold_in(KEY, step % VALIDATION_CYCLE), BATCH_SIZE)
-    loss = jnp.mean(batched_loss_baseline(model, keys_loss, MAX_LEVEL))
-    return loss, model, opt_state
+    return model, opt_state
 
 
 def step_delayed_mlmc(
@@ -431,7 +425,7 @@ def step_delayed_mlmc(
     grad_per_level: List[DeepHedgingLoss],
     key: PRNGKeyArray,
     step: int,
-) -> Tuple[Float[Array, ""], DeepHedgingLoss, optax.OptState, List[DeepHedgingLoss]]:
+) -> Tuple[DeepHedgingLoss, optax.OptState, List[DeepHedgingLoss]]:
     keys = jr.split(key, BATCH_SIZE)
     periods = [math.floor(2 ** (1 + SMOOTHNESS_DECAY_RATE * (level - 1))) for level in LEVELS]
     for level in reversed(LEVELS):
@@ -443,9 +437,7 @@ def step_delayed_mlmc(
         grad_per_level[level] = grad
 
     model, opt_state = _step_from_grad_per_level(model, optim, opt_state, grad_per_level)
-    keys_loss = jr.split(jr.fold_in(KEY, step % VALIDATION_CYCLE), BATCH_SIZE)
-    loss = jnp.mean(batched_loss_baseline(model, keys_loss, MAX_LEVEL))
-    return loss, model, opt_state, grad_per_level
+    return model, opt_state, grad_per_level
 
 
 def run_deep_hedging() -> None:
@@ -458,9 +450,8 @@ def run_deep_hedging() -> None:
     # for method in tqdm(["baseline"]):
     # for method in tqdm(["mlmc"]):
     # for method in tqdm(["delayed_mlmc"]):
-    # for method in tqdm(["delayed_mlmc", "baseline"]):
     # for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
-    for method in tqdm(["baseline"]):
+    for method in tqdm(["mlmc"]):
         losses_outer = []
         times_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
@@ -492,16 +483,16 @@ def run_deep_hedging() -> None:
                     match method:
                         case "baseline":
                             loss, model, opt_state = step_baseline(
-                                model, optim, opt_state, key_inner, MAX_LEVEL, i
+                                model, optim, opt_state, key_inner, MAX_LEVEL
                             )
                         case "mlmc":
-                            loss, model, opt_state = step_mlmc(
-                                model, optim, opt_state, key_inner, i
-                            )
+                            model, opt_state = step_mlmc(model, optim, opt_state, key_inner)
                         case "delayed_mlmc":
-                            loss, model, opt_state, grad_per_level = step_delayed_mlmc(
+                            model, opt_state, grad_per_level = step_delayed_mlmc(
                                 model, optim, opt_state, grad_per_level, key_inner, i
                             )
+                    keys_loss = jr.split(jr.fold_in(KEY, i % VALIDATION_CYCLE), BATCH_SIZE)
+                    loss = jnp.mean(batched_loss_baseline(model, keys_loss, MAX_LEVEL))
                     losses_inner.append(loss)
                     times_inner.append(time.time())
                     pbar.set_description(desc="Step: {:>3d}, Loss: {:>5.2f}".format(i, float(loss)))
