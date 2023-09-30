@@ -59,15 +59,10 @@ PERIOD_PER_LEVEL = [math.floor(2 ** (1 + SMOOTHNESS_DECAY_RATE * (l - 1))) for l
 BATCH_SIZE_PER_LEVEL = [
     math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * l)) for l in LEVELS
 ]
-COST_PER_LEVEL = [
-    2 ** (COST_RATE * l) * b / BATCH_SIZE for b, l in zip(BATCH_SIZE_PER_LEVEL, LEVELS)
-]
 VARIANCE_PER_LEVEL = [
     2 ** (-VARIANCE_DECAY_RATE * l) * BATCH_SIZE / b for b, l in zip(BATCH_SIZE_PER_LEVEL, LEVELS)
 ]
-TOTAL_MLMC_COST = sum(COST_PER_LEVEL)
 TOTAL_MLMC_VARIANCE = sum(VARIANCE_PER_LEVEL)
-TOTAL_BASELINE_COST = 2**MAX_LEVEL / TOTAL_MLMC_VARIANCE
 
 VALIDATION_CYCLE = 2**MAX_LEVEL
 
@@ -241,6 +236,7 @@ class DeepHedgingLoss(eqx.Module):
         z = jnp.maximum(0, s1 - STRIKE_PRICE)
         hedging_pnl = sol.ys[0, 1]
         loss = lambda z: (z**2 + 1) / 2  # noqa
+        # loss = lambda z: jnp.exp(z) - 1  # noqa
         w = 10 * self.w  # rescale to match learning rate with NN
         J = w + loss(z - hedging_pnl - w)  # type: ignore[no-untyped-call]
         return J
@@ -427,12 +423,11 @@ def step_delayed_mlmc(
     step: int,
 ) -> Tuple[DeepHedgingLoss, optax.OptState, List[DeepHedgingLoss]]:
     keys = jr.split(key, BATCH_SIZE)
-    periods = [math.floor(2 ** (1 + SMOOTHNESS_DECAY_RATE * (level - 1))) for level in LEVELS]
     for level in reversed(LEVELS):
-        if step % periods[level] != 0:
+        if step % PERIOD_PER_LEVEL[level] != 0:
             continue
         batch_size = math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * level))
-        keys = jr.split(key, batch_size)
+        keys = jr.split(jr.fold_in(key, level), batch_size)
         loss, grad = loss_and_grad(model, keys, level)
         grad_per_level[level] = grad
 
@@ -549,7 +544,7 @@ if __name__ == "__main__":
     logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
     with jax.disable_jit(False):
-        for k in range(3):
+        for k in range(3, 10):
             KEY = jr.PRNGKey(20 + k)
             run_deep_hedging()
         # examine_mlmc_decay()

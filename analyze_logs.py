@@ -69,7 +69,7 @@ def plot_variance_decay(array_dict: ArrayDict) -> None:
     plt.legend(
         [(line, band), (O05,), (O1,), (O2,)],
         [
-            r"$\mathrm{E}\|\Delta\nabla_\ell \hat F\|^2$",
+            r"$\mathrm{E}\|\nabla\Delta_\ell \hat F\|^2$",
             r"$O(2^{-\ell/2})$",
             r"$O(2^{-\ell})$",
             r"$O(2^{-2\ell})$",
@@ -77,7 +77,7 @@ def plot_variance_decay(array_dict: ArrayDict) -> None:
     )
     plt.xlabel(r"Level $\ell$")
     plt.ylabel(
-        r"Trace of the second moment of the coupled gradient estimator $\Delta\nabla_\ell \hat F$"
+        r"Trace of the second moment of the coupled gradient estimator $\nabla\Delta_\ell \hat F$"
     )
     plt.yscale("log")
     plt.savefig("./logs/variance_decay.pdf")
@@ -99,7 +99,7 @@ def plot_smoothness_decay(array_dict: ArrayDict) -> None:
     O05 = plt.plot(levels, [mean_per_level[0] * 2 ** (-0.5 * l) for l in levels], c=tab10(7))[0]
     O1 = plt.plot(levels, [mean_per_level[0] * 2 ** (-l) for l in levels], c=tab10(7))[0]
     O2 = plt.plot(levels, [mean_per_level[0] * 2 ** (-2 * l) for l in levels], c=tab10(7))[0]
-    smoothness_definition = r"$\mathrm{E}\left\|\frac{\Delta\nabla_\ell \hat F(x_{t+1}, \xi_{t+1}) - \Delta\nabla_\ell \hat F(x_t, \xi_t)}{x_{t+1} - x_t}\right\|$"
+    smoothness_definition = r"$\mathrm{E}\left\|\frac{\nabla\Delta_\ell \hat F(x_{t+1}, \xi_{t+1}) - \nabla\Delta_\ell \hat F(x_t, \xi_t)}{x_{t+1} - x_t}\right\|$"
     plt.legend(
         [(line, band), (O05,), (O1,), (O2,)],
         [smoothness_definition, r"$O(2^{-\ell/2})$", r"$O(2^{-\ell})$", r"$O(2^{-\ell/2})$"],
@@ -122,7 +122,8 @@ BATCH_SIZE_PER_LEVEL = [
     math.ceil(BATCH_SIZE / 2 ** (0.5 * (VARIANCE_DECAY_RATE + COST_RATE) * l)) for l in LEVELS
 ]
 COST_PER_LEVEL = [
-    2 ** (COST_RATE * l) * b / BATCH_SIZE for b, l in zip(BATCH_SIZE_PER_LEVEL, LEVELS)
+    (1.5 * 2 ** (COST_RATE * l) * b / BATCH_SIZE if l > 0 else 1.0)
+    for b, l in zip(BATCH_SIZE_PER_LEVEL, LEVELS)
 ]
 VARIANCE_PER_LEVEL = [
     2 ** (-VARIANCE_DECAY_RATE * l) * BATCH_SIZE / b for b, l in zip(BATCH_SIZE_PER_LEVEL, LEVELS)
@@ -135,7 +136,8 @@ VALIDATION_CYCLE = 2**MAX_LEVEL
 
 
 def apply_smoothing(signal: np.ndarray) -> np.ndarray:
-    filter_size = len(signal) // 5
+    # filter_size = len(signal) // 5
+    filter_size = VALIDATION_CYCLE
     _filter = np.ones(filter_size)
     filtered = np.convolve(signal, _filter)[: len(signal)]
     filtered /= np.minimum(np.arange(1, len(signal) + 1), filter_size)
@@ -149,9 +151,9 @@ def plot_learning_curves(array_dict: ArrayDict) -> None:
     mean_base = np.mean(losses_base, axis=0)
     mean_mlmc = np.mean(losses_mlmc, axis=0)
     mean_dmlmc = np.mean(losses_dmlmc, axis=0)
-    std_base = np.std(losses_base, ddof=1, axis=0)
-    std_mlmc = np.std(losses_mlmc, ddof=1, axis=0)
-    std_dmlmc = np.std(losses_dmlmc, ddof=1, axis=0)
+    std_base = np.std(losses_base, ddof=1, axis=0)  / losses_base.shape[0] ** 0.5
+    std_mlmc = np.std(losses_mlmc, ddof=1, axis=0)  / losses_mlmc.shape[0] ** 0.5
+    std_dmlmc = np.std(losses_dmlmc, ddof=1, axis=0)  / losses_dmlmc.shape[0] ** 0.5
     mean_base, mean_mlmc, mean_dmlmc, std_base, std_mlmc, std_dmlmc = map(
         apply_smoothing,
         [mean_base, mean_mlmc, mean_dmlmc, std_base, std_mlmc, std_dmlmc],
@@ -191,8 +193,7 @@ def plot_learning_curves(array_dict: ArrayDict) -> None:
         )
 
         plt.xlim([0, min(max(cost_base), max(cost_mlmc), max(cost_dmlmc))])
-        plt.ylabel("Losson")
-        plt.xlabel("Cumurative parallel complexity")
+        plt.ylabel("Loss")
 
         plt.legend(
             [(line_base, band_base), (line_mlmc, band_mlmc), (line_dmlmc, band_dmlmc)],
@@ -200,8 +201,12 @@ def plot_learning_curves(array_dict: ArrayDict) -> None:
         )
 
     _plot(tot_cost_base, tot_cost_mlmc, tot_cost_dmlmc)
+    plt.xlabel("Cumurative complexity")
     plt.savefig("logs/learning_curve_total_complexity.pdf")
+    plt.figure()
+
     _plot(para_cost_base, para_cost_mlmc, para_cost_dmlmc)
+    plt.xlabel("Cumurative parallel complexity")
     plt.savefig("logs/learning_curve_parallel_complexity.pdf")
 
 
@@ -210,7 +215,8 @@ def main(timestamps: Optional[List[int]] = None) -> None:
         [str(t) for t in timestamps] if timestamps else [get_latest_timestamp()]
     )
 
-    parsed_timestamps = [ts for ts in get_all_timestamps() if ts >= "20230927"]
+    # parsed_timestamps = [ts for ts in get_all_timestamps() if ts >= "20230929092321"]
+    parsed_timestamps = [ts for ts in get_all_timestamps() if ts >= "20230927"] 
 
     array_dict = try_load_arrays(parsed_timestamps)
     array_dict = {k: list(filter(lambda x: x is not None, v)) for k, v in array_dict.items()}
