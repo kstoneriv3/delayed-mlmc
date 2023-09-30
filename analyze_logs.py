@@ -53,6 +53,7 @@ def try_load_arrays(timestamps: List[str]) -> ArrayDict:
 
 
 def plot_variance_decay(array_dict: ArrayDict) -> None:
+    plt.figure()
     for norms in [
         array_dict[k][0] for k in ["norms_before", "norms_after"] if len(array_dict[k]) > 0
     ]:
@@ -88,6 +89,7 @@ def plot_variance_decay(array_dict: ArrayDict) -> None:
 
 
 def plot_smoothness_decay(array_dict: ArrayDict) -> None:
+    plt.figure()
     for norms in [
         array_dict[k][0]
         for k in ["diff_norms_before", "diff_norms_after"]
@@ -99,7 +101,8 @@ def plot_smoothness_decay(array_dict: ArrayDict) -> None:
         if len(norms.shape) == 3:
             norms = np.mean(norms, axis=2)  # TODO: remove
         mean_per_level = norms.mean(axis=1)  # type: ignore[union-attr]
-        std_per_level = norms.std(axis=1) / norms.shape[1]  # type: ignore[union-attr]
+        # std_per_level = norms.std(axis=1) / norms.shape[1] ** 0.5  # type: ignore[union-attr]
+        std_per_level = norms.std(axis=1)  # type: ignore[union-attr]
         std_per_level_log_trans = std_per_level / mean_per_level
         upper = mean_per_level * np.exp(std_per_level / mean_per_level)
         lower = mean_per_level / np.exp(std_per_level / mean_per_level)
@@ -109,7 +112,7 @@ def plot_smoothness_decay(array_dict: ArrayDict) -> None:
         O05 = plt.plot(levels, [mean_per_level[0] * 2 ** (-0.5 * l) for l in levels], c=tab10(7))[0]
         O1 = plt.plot(levels, [mean_per_level[0] * 2 ** (-l) for l in levels], c=tab10(7))[0]
         O2 = plt.plot(levels, [mean_per_level[0] * 2 ** (-2 * l) for l in levels], c=tab10(7))[0]
-        smoothness_definition = r"$\mathrm{E}\left\|\frac{\nabla\Delta_\ell \hat F(x_{t+1}, \xi_{t+1}) - \nabla\Delta_\ell \hat F(x_t, \xi_t)}{x_{t+1} - x_t}\right\|$"
+        smoothness_definition = r"$\mathrm{E}\left\|\frac{\nabla\Delta_\ell \hat F(x_{t+1}, \xi) - \nabla\Delta_\ell \hat F(x_t, \xi)}{x_{t+1} - x_t}\right\|$"
         plt.legend(
             [(line, band), (O05,), (O1,), (O2,)],
             [smoothness_definition, r"$O(2^{-\ell/2})$", r"$O(2^{-\ell})$", r"$O(2^{-\ell/2})$"],
@@ -164,10 +167,11 @@ def plot_learning_curves(array_dict: ArrayDict) -> None:
     std_base = np.std(losses_base, ddof=1, axis=0) / losses_base.shape[0] ** 0.5
     std_mlmc = np.std(losses_mlmc, ddof=1, axis=0) / losses_mlmc.shape[0] ** 0.5
     std_dmlmc = np.std(losses_dmlmc, ddof=1, axis=0) / losses_dmlmc.shape[0] ** 0.5
-    mean_base, mean_mlmc, mean_dmlmc, std_base, std_mlmc, std_dmlmc = map(
-        apply_smoothing,
-        [mean_base, mean_mlmc, mean_dmlmc, std_base, std_mlmc, std_dmlmc],
-    )
+    if False:  # whether to apply filtering
+        mean_base, mean_mlmc, mean_dmlmc, std_base, std_mlmc, std_dmlmc = map(
+            apply_smoothing,
+            [mean_base, mean_mlmc, mean_dmlmc, std_base, std_mlmc, std_dmlmc],
+        )
 
     tot_cost_base = np.cumsum([TOTAL_BASELINE_COST for step in range(losses_base.shape[1])])
     tot_cost_mlmc = np.cumsum([TOTAL_MLMC_COST for step in range(losses_mlmc.shape[1])])
@@ -188,6 +192,8 @@ def plot_learning_curves(array_dict: ArrayDict) -> None:
     )
 
     def _plot(cost_base: np.ndarray, cost_mlmc: np.ndarray, cost_dmlmc: np.ndarray) -> None:
+        plt.figure()
+
         line_base = plt.plot(cost_base, mean_base, c=tab10(0))[0]
         line_mlmc = plt.plot(cost_mlmc, mean_mlmc, c=tab10(1))[0]
         line_dmlmc = plt.plot(cost_dmlmc, mean_dmlmc, c=tab10(2))[0]
@@ -213,7 +219,6 @@ def plot_learning_curves(array_dict: ArrayDict) -> None:
     _plot(tot_cost_base, tot_cost_mlmc, tot_cost_dmlmc)
     plt.xlabel("Cumurative complexity")
     plt.savefig("logs/learning_curve_total_complexity.pdf")
-    plt.figure()
 
     _plot(para_cost_base, para_cost_mlmc, para_cost_dmlmc)
     plt.xlabel("Cumurative parallel complexity")
@@ -231,7 +236,8 @@ def main(timestamps: Optional[List[int]] = None) -> None:
 
     array_dict = try_load_arrays(parsed_timestamps)
     array_dict = {k: list(filter(lambda x: x is not None, v)) for k, v in array_dict.items()}
-    breakpoint()
+
+    # breakpoint()
 
     plot_variance_decay(array_dict)
     plot_smoothness_decay(array_dict)

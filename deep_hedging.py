@@ -353,7 +353,7 @@ def log_normalized_grad_diff_l2_norms(
     norms_outer = [None] * (MAX_LEVEL + 1)
     for level in tqdm(reversed(LEVELS), desc=f"Evaluating smoothness"):
         norms_inner = []
-        for i in trange(2**8, desc=f"Level {level}", leave=False):
+        for i in trange(2**6, desc=f"Level {level}", leave=False):
             key_loop = jr.fold_in(key, i)
             model_perturbed = perturb_model(model, key_loop)
             keys = jr.split(key_loop, (2**9,))
@@ -511,9 +511,6 @@ def examine_mlmc_decay() -> None:
     key, model_key = jr.split(KEY, 2)
     model = model_prev = DeepHedgingLoss.create_from_dim_and_key(DIM, model_key)
 
-    log_normalized_grad_diff_l2_norms(model, save_path / "before", key)
-    log_grad_l2_norms(model, save_path / "before", key)
-
     with mlflow.start_run():
         global_params = {
             k: v
@@ -522,6 +519,9 @@ def examine_mlmc_decay() -> None:
         }
         global_params.update({"KEY": int(KEY[1])})  # type: ignore
         mlflow.log_params(global_params)
+
+        log_normalized_grad_diff_l2_norms(model, save_path / "before", key)
+        log_grad_l2_norms(model, save_path / "before", key)
 
         optim = optax.sgd(LR)
         opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
