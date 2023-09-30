@@ -32,7 +32,7 @@ def try_np_load(path: Path) -> Optional[np.ndarray]:
 
 def try_load_arrays(timestamps: List[str]) -> ArrayDict:
     array_dict: ArrayDict = defaultdict(list)
-    for ts in timestamps:
+    for ts in sorted(timestamps):
         log_dir = Path("./logs") / ts
         array_dict["losses"] += [try_np_load(log_dir / "losses.npy")]
         array_dict["diff_norms_before"] += [
@@ -53,61 +53,71 @@ def try_load_arrays(timestamps: List[str]) -> ArrayDict:
 
 
 def plot_variance_decay(array_dict: ArrayDict) -> None:
-    norms = array_dict["norms_after"][0]
-    assert isinstance(norms, np.ndarray)
-    mean_per_level = (norms**2).mean(axis=1)
-    std_per_level = (norms**2).std(axis=1) / norms.shape[1] ** 0.5
-    std_per_level_log_trans = std_per_level / mean_per_level
-    upper = mean_per_level * np.exp(std_per_level / mean_per_level)
-    lower = mean_per_level / np.exp(std_per_level / mean_per_level)
-    levels = range(norms.shape[0])
-    line = plt.plot(levels, mean_per_level)[0]
-    band = plt.fill_between(levels, upper, lower, alpha=0.3)
-    O05 = plt.plot(levels, [mean_per_level[0] * 2 ** (-0.5 * l) for l in levels], c=tab10(7))[0]
-    O1 = plt.plot(levels, [mean_per_level[0] * 2 ** (-l) for l in levels], c=tab10(7))[0]
-    O2 = plt.plot(levels, [mean_per_level[0] * 2 ** (-2 * l) for l in levels], c=tab10(7))[0]
-    plt.legend(
-        [(line, band), (O05,), (O1,), (O2,)],
-        [
-            r"$\mathrm{E}\|\nabla\Delta_\ell \hat F\|^2$",
-            r"$O(2^{-\ell/2})$",
-            r"$O(2^{-\ell})$",
-            r"$O(2^{-2\ell})$",
-        ],
-    )
-    plt.xlabel(r"Level $\ell$")
-    plt.ylabel(
-        r"Trace of the second moment of the coupled gradient estimator $\nabla\Delta_\ell \hat F$"
-    )
-    plt.yscale("log")
-    plt.savefig("./logs/variance_decay.pdf")
+    for norms in [
+        array_dict[k][0] for k in ["norms_before", "norms_after"] if len(array_dict[k]) > 0
+    ]:
+        if norms is None:
+            continue
+        assert isinstance(norms, np.ndarray)
+        mean_per_level = (norms**2).mean(axis=1)
+        std_per_level = (norms**2).std(axis=1) / norms.shape[1] ** 0.5
+        std_per_level_log_trans = std_per_level / mean_per_level
+        upper = mean_per_level * np.exp(std_per_level / mean_per_level)
+        lower = mean_per_level / np.exp(std_per_level / mean_per_level)
+        levels = range(norms.shape[0])
+        line = plt.plot(levels, mean_per_level)[0]
+        band = plt.fill_between(levels, upper, lower, alpha=0.3)
+        O05 = plt.plot(levels, [mean_per_level[0] * 2 ** (-0.5 * l) for l in levels], c=tab10(7))[0]
+        O1 = plt.plot(levels, [mean_per_level[0] * 2 ** (-l) for l in levels], c=tab10(7))[0]
+        O2 = plt.plot(levels, [mean_per_level[0] * 2 ** (-2 * l) for l in levels], c=tab10(7))[0]
+        plt.legend(
+            [(line, band), (O05,), (O1,), (O2,)],
+            [
+                r"$\mathrm{E}\|\nabla\Delta_\ell \hat F\|^2$",
+                r"$O(2^{-\ell/2})$",
+                r"$O(2^{-\ell})$",
+                r"$O(2^{-2\ell})$",
+            ],
+        )
+        plt.xlabel(r"Level $\ell$")
+        plt.ylabel(
+            r"Trace of the second moment of the coupled gradient estimator $\nabla\Delta_\ell \hat F$"
+        )
+        plt.yscale("log")
+        plt.savefig("./logs/variance_decay.pdf")
 
 
 def plot_smoothness_decay(array_dict: ArrayDict) -> None:
-    norms = cast(np.ndarray, array_dict["diff_norms_after"][0])
-    assert isinstance(norms, np.ndarray)
-    if len(norms.shape) == 3:
-        norms = np.mean(norms, axis=2)  # TODO: remove
-    mean_per_level = norms.mean(axis=1)
-    std_per_level = norms.std(axis=1) / norms.shape[1] ** 0.5
-    std_per_level_log_trans = std_per_level / mean_per_level
-    upper = mean_per_level * np.exp(std_per_level / mean_per_level)
-    lower = mean_per_level / np.exp(std_per_level / mean_per_level)
-    levels = range(norms.shape[0])
-    line = plt.plot(levels, mean_per_level)[0]
-    band = plt.fill_between(levels, upper, lower, alpha=0.3)
-    O05 = plt.plot(levels, [mean_per_level[0] * 2 ** (-0.5 * l) for l in levels], c=tab10(7))[0]
-    O1 = plt.plot(levels, [mean_per_level[0] * 2 ** (-l) for l in levels], c=tab10(7))[0]
-    O2 = plt.plot(levels, [mean_per_level[0] * 2 ** (-2 * l) for l in levels], c=tab10(7))[0]
-    smoothness_definition = r"$\mathrm{E}\left\|\frac{\nabla\Delta_\ell \hat F(x_{t+1}, \xi_{t+1}) - \nabla\Delta_\ell \hat F(x_t, \xi_t)}{x_{t+1} - x_t}\right\|$"
-    plt.legend(
-        [(line, band), (O05,), (O1,), (O2,)],
-        [smoothness_definition, r"$O(2^{-\ell/2})$", r"$O(2^{-\ell})$", r"$O(2^{-\ell/2})$"],
-    )
-    plt.xlabel(r"Level $\ell$")
-    plt.ylabel(r"Mean of per-step smoothness")
-    plt.yscale("log")
-    plt.savefig("./logs/smoothness_decay.pdf")
+    for norms in [
+        array_dict[k][0]
+        for k in ["diff_norms_before", "diff_norms_after"]
+        if len(array_dict[k]) > 0
+    ]:
+        if norms is None:
+            continue
+        assert isinstance(norms, np.ndarray)
+        if len(norms.shape) == 3:
+            norms = np.mean(norms, axis=2)  # TODO: remove
+        mean_per_level = norms.mean(axis=1)  # type: ignore[union-attr]
+        std_per_level = norms.std(axis=1) / norms.shape[1]  # type: ignore[union-attr]
+        std_per_level_log_trans = std_per_level / mean_per_level
+        upper = mean_per_level * np.exp(std_per_level / mean_per_level)
+        lower = mean_per_level / np.exp(std_per_level / mean_per_level)
+        levels = range(norms.shape[0])  # type: ignore[union-attr]
+        line = plt.plot(levels, mean_per_level)[0]
+        band = plt.fill_between(levels, upper, lower, alpha=0.3)
+        O05 = plt.plot(levels, [mean_per_level[0] * 2 ** (-0.5 * l) for l in levels], c=tab10(7))[0]
+        O1 = plt.plot(levels, [mean_per_level[0] * 2 ** (-l) for l in levels], c=tab10(7))[0]
+        O2 = plt.plot(levels, [mean_per_level[0] * 2 ** (-2 * l) for l in levels], c=tab10(7))[0]
+        smoothness_definition = r"$\mathrm{E}\left\|\frac{\nabla\Delta_\ell \hat F(x_{t+1}, \xi_{t+1}) - \nabla\Delta_\ell \hat F(x_t, \xi_t)}{x_{t+1} - x_t}\right\|$"
+        plt.legend(
+            [(line, band), (O05,), (O1,), (O2,)],
+            [smoothness_definition, r"$O(2^{-\ell/2})$", r"$O(2^{-\ell})$", r"$O(2^{-\ell/2})$"],
+        )
+        plt.xlabel(r"Level $\ell$")
+        plt.ylabel(r"Mean of per-step smoothness")
+        plt.yscale("log")
+        plt.savefig("./logs/smoothness_decay.pdf")
 
 
 MAX_LEVEL = 6
@@ -217,15 +227,15 @@ def main(timestamps: Optional[List[int]] = None) -> None:
 
     # parsed_timestamps = [ts for ts in get_all_timestamps() if ts >= "20230929092321"]
     # parsed_timestamps = [ts for ts in get_all_timestamps() if ts >= "20230927"]
-    parsed_timestamps = [ts for ts in get_all_timestamps() if ts >= "202309301552"]
+    parsed_timestamps = [ts for ts in get_all_timestamps() if ts >= "20230930184201"]
 
     array_dict = try_load_arrays(parsed_timestamps)
     array_dict = {k: list(filter(lambda x: x is not None, v)) for k, v in array_dict.items()}
     breakpoint()
 
-    # plot_variance_decay(array_dict)
+    plot_variance_decay(array_dict)
     plot_smoothness_decay(array_dict)
-    # plot_learning_curves(array_dict)
+    plot_learning_curves(array_dict)
 
 
 if __name__ == "__main__":

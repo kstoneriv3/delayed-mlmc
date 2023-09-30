@@ -35,13 +35,13 @@ from jaxtyping import Array, Float, PRNGKeyArray, PyTree
 from tqdm import tqdm, trange
 
 # With CPU, it takes an hour to compile, and 5 mins per iteration
-jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
+# jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 
 
 T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
 
-# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-3, 1000, 7
-BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 800, 6
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-3, 1000, 7
+# BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 800, 6
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 1
 
 KEY = jr.PRNGKey(10)
@@ -545,8 +545,8 @@ if __name__ == "__main__":
     logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
     with jax.disable_jit(False):
-        # examine_mlmc_decay()
-        # exit()
+        examine_mlmc_decay()
+        exit()
         for k in range(5, 10):
             KEY = jr.PRNGKey(20 + k)
             run_deep_hedging()
