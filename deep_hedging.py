@@ -41,13 +41,13 @@ jax.config.update("jax_platform_name", "cpu")  # type: ignore[no-untyped-call]
 T0, T1, N_STEPS_LEVEL0, DIM = 0, 1, 10, 1
 
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**11, 1e-3, 1000, 7
-BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 400, 6
+BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**9, 1e-3, 800, 6
 # BATCH_SIZE, LR, N_ITER, MAX_LEVEL = 2**5, 1e-2, 20, 1
 
 KEY = jr.PRNGKey(10)
 MU = 1.0
 SIGMA = 1.0
-STRIKE_PRICE = jnp.exp(MU)
+STRIKE_PRICE = 3.0
 
 N_REPEAT_EXPERIMENT = 1
 COST_RATE = 1
@@ -152,7 +152,7 @@ class HoldingStrategy(eqx.Module):
             in_size=1 + dim,
             out_size=dim,
             width_size=32,
-            depth=4,
+            depth=2,
             activation=jax.nn.silu,
             final_activation=jax.nn.sigmoid,
             key=key,
@@ -187,30 +187,32 @@ class DeepHedgingLoss(eqx.Module):
     @classmethod
     def create_from_dim_and_key(cls, dim: Int, key: PRNGKeyArray) -> "DeepHedgingLoss":
         assert dim == 1
-        h = HoldingStrategy(dim, key)
-        w = jnp.array(0.0)
+        keys = jr.split(key, 2)
+        h = HoldingStrategy(dim, keys[0])
+        w = jnp.mean(
+            jnp.maximum(
+                jnp.exp(MU - SIGMA**2 / 2 + SIGMA * jr.normal(keys[1], (10**6,)))
+                - STRIKE_PRICE,
+                0,
+            )
+        )
         return cls(h=h, w=w, s_drift=BlackScholesDrift, s_diffusion=BlackScholesDiffusion, dim=dim)
 
     def drift(self, t: Scalar, y: Float[Array, "dim+1"], args: Any) -> Float[Array, "dim+1"]:
         # We can only handle cases where dim = 1.
         s = y[: self.dim]
-        dhdt = jax.jacobian(self.h, argnums=0)(t, s)
-        dhds = jax.jacobian(self.h, argnums=1)(t, s)[:, 0]
-        dhdss = jax.hessian(self.h, argnums=1)(t, s)[:, 0, 0]
         s_drift = self.s_drift(t, s)
-        s_diffusion = jnp.diag(self.s_diffusion(t, s))  # type: ignore[no-untyped-call]
-        h_drift = dhdt + dhds * s_drift + dhdss * s_diffusion**2 / 2
-        return jnp.concatenate([s_drift, s * h_drift], axis=0)
+        h_drift = s_drift * self.h(t, s)
+        return jnp.concatenate([s_drift, h_drift], axis=0)
 
     def diffusion(
         self, t: Scalar, y: Float[Array, "dim+1"], args: Any
     ) -> Float[Array, "dim+1 dim"]:
         # We can only handle cases where dim = 1.
         s = y[: self.dim]
-        dhds = jax.jacobian(self.h, argnums=1)(t, s)[:, 0]
         s_diffusion = self.s_diffusion(t, s)
-        h_diffusion = dhds * s_diffusion
-        return jnp.concatenate([s_diffusion, s * h_diffusion], axis=0)
+        h_diffusion = s_diffusion * self.h(t, s)[None]
+        return jnp.concatenate([s_diffusion, h_diffusion], axis=0)
 
     @jax.named_scope("DeepHedgingLoss")
     def __call__(
@@ -235,10 +237,8 @@ class DeepHedgingLoss(eqx.Module):
         s1 = sol.ys[0, 0]
         z = jnp.maximum(0, s1 - STRIKE_PRICE)
         hedging_pnl = sol.ys[0, 1]
-        loss = lambda z: (z**2 + 1) / 2  # noqa
-        # loss = lambda z: jnp.exp(z) - 1  # noqa
-        w = 10 * self.w  # rescale to match learning rate with NN
-        J = w + loss(z - hedging_pnl - w)  # type: ignore[no-untyped-call]
+        w = self.w  # rescale to match learning rate with NN
+        J = (z - hedging_pnl - w) ** 2  # type: ignore[no-untyped-call]
         return J
 
 
@@ -446,7 +446,7 @@ def run_deep_hedging() -> None:
     # for method in tqdm(["mlmc"]):
     # for method in tqdm(["delayed_mlmc"]):
     # for method in tqdm(["delayed_mlmc", "mlmc", "baseline"]):
-    for method in tqdm(["mlmc"]):
+    for method in tqdm(["delayed_mlmc"]):
         losses_outer = []
         times_outer = []
         for n in trange(N_REPEAT_EXPERIMENT, desc=f"Using {method}", leave=False):
@@ -480,6 +480,7 @@ def run_deep_hedging() -> None:
                             loss, model, opt_state = step_baseline(
                                 model, optim, opt_state, key_inner, MAX_LEVEL
                             )
+                            print(model.w)
                         case "mlmc":
                             model, opt_state = step_mlmc(model, optim, opt_state, key_inner)
                         case "delayed_mlmc":
@@ -544,7 +545,8 @@ if __name__ == "__main__":
     logging.getLogger("jax").setLevel(logging.INFO)
     jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
     with jax.disable_jit(False):
-        for k in range(3, 10):
+        # examine_mlmc_decay()
+        # exit()
+        for k in range(5, 10):
             KEY = jr.PRNGKey(20 + k)
             run_deep_hedging()
-        # examine_mlmc_decay()

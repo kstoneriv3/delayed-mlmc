@@ -151,9 +151,9 @@ def plot_learning_curves(array_dict: ArrayDict) -> None:
     mean_base = np.mean(losses_base, axis=0)
     mean_mlmc = np.mean(losses_mlmc, axis=0)
     mean_dmlmc = np.mean(losses_dmlmc, axis=0)
-    std_base = np.std(losses_base, ddof=1, axis=0)  / losses_base.shape[0] ** 0.5
-    std_mlmc = np.std(losses_mlmc, ddof=1, axis=0)  / losses_mlmc.shape[0] ** 0.5
-    std_dmlmc = np.std(losses_dmlmc, ddof=1, axis=0)  / losses_dmlmc.shape[0] ** 0.5
+    std_base = np.std(losses_base, ddof=1, axis=0) / losses_base.shape[0] ** 0.5
+    std_mlmc = np.std(losses_mlmc, ddof=1, axis=0) / losses_mlmc.shape[0] ** 0.5
+    std_dmlmc = np.std(losses_dmlmc, ddof=1, axis=0) / losses_dmlmc.shape[0] ** 0.5
     mean_base, mean_mlmc, mean_dmlmc, std_base, std_mlmc, std_dmlmc = map(
         apply_smoothing,
         [mean_base, mean_mlmc, mean_dmlmc, std_base, std_mlmc, std_dmlmc],
@@ -216,10 +216,12 @@ def main(timestamps: Optional[List[int]] = None) -> None:
     )
 
     # parsed_timestamps = [ts for ts in get_all_timestamps() if ts >= "20230929092321"]
-    parsed_timestamps = [ts for ts in get_all_timestamps() if ts >= "20230927"] 
+    # parsed_timestamps = [ts for ts in get_all_timestamps() if ts >= "20230927"]
+    parsed_timestamps = [ts for ts in get_all_timestamps() if ts >= "202309301552"]
 
     array_dict = try_load_arrays(parsed_timestamps)
     array_dict = {k: list(filter(lambda x: x is not None, v)) for k, v in array_dict.items()}
+    breakpoint()
 
     # plot_variance_decay(array_dict)
     plot_smoothness_decay(array_dict)
